@@ -1,0 +1,61 @@
+/* combobox.css —— PCL 风格 ComboBox（静态样式，颜色过渡由 Java Timeline 控制）
+ * 放在 src/main/resources/combobox.css
+ */
+
+.combo-box.pcl-combo {
+    -fx-background-color: white;
+    -fx-border-color: #E5E7EB;
+    -fx-border-width: 1px;
+    -fx-border-radius: 6px;
+    -fx-background-radius: 6px;
+    -fx-font-size: 12px;
+}
+
+/* 主按钮文字区域
+ * 内边距必须与下面「弹出层选项行」完全一致：
+ * JavaFX 的弹出层高度是按【按钮区单元格】的行高算的，行高不一致时
+ * 实际选项行更高，列表底部就会顶出弹出层边框一点（行数越多越明显）。 */
+.combo-box.pcl-combo .list-cell {
+    -fx-background-color: transparent;
+    -fx-padding: 7 12 7 12;
+    -fx-text-fill: #1F2937;
+    -fx-font-size: 12px;
+}
+
+/* 悬浮：边框变浅蓝 + 微光晕 */
+.combo-box.pcl-combo:hover {
+    -fx-border-color: #BBDEFB;
+    -fx-effect: dropshadow(gaussian, rgba(25,118,210,0.08), 4, 0, 0, 1);
+}
+
+/* 展开时：边框变深蓝 */
+.combo-box.pcl-combo:showing {
+    -fx-border-color: #1976D2;
+    -fx-effect: dropshadow(gaussian, rgba(25,118,210,0.15), 6, 0, 0, 2);
+}
+
+/* 下拉箭头 */
+.combo-box.pcl-combo .arrow { -fx-background-color: #9CA3AF; }
+.combo-box.pcl-combo:showing .arrow { -fx-background-color: #1976D2; }
+
+/* 下拉弹出面板（独立卡片） */
+.combo-box.pcl-combo .combo-box-popup {
+    -fx-background-color: transparent;
+}
+.combo-box.pcl-combo .combo-box-popup .list-view {
+    -fx-background-color: white;
+    -fx-border-color: #E5E7EB;
+    -fx-border-width: 1px;
+    -fx-border-radius: 8px;
+    -fx-background-radius: 8px;
+    -fx-padding: 4px;
+    -fx-effect: dropshadow(gaussian, rgba(0,0,0,0.12), 10, 0, 0, 4);
+}
+
+/* 选项行：字号/内边距兜底（背景色/圆角由 Java SmoothFavListCell 逐帧设置） */
+.combo-box.pcl-combo .combo-box-popup .list-view .list-cell {
+    -fx-text-fill: #374151;
+    -fx-font-size: 12px;
+    -fx-padding: 7 12 7 12;
+    -fx-background-radius: 4px;
+}
