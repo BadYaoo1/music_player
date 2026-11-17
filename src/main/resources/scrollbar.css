@@ -1,0 +1,39 @@
+/* 竖向滚动条：整体加粗到 14px */
+.scroll-pane .scroll-bar:vertical {
+    -fx-pref-width: 14px;
+    -fx-background-color: transparent;
+}
+/* 横向滚动条：同样加粗到 14px */
+.scroll-pane .scroll-bar:horizontal {
+    -fx-pref-height: 14px;
+    -fx-background-color: transparent;
+}
+/* 轨道透明 */
+.scroll-pane .scroll-bar:vertical .track,
+.scroll-pane .scroll-bar:horizontal .track {
+    -fx-background-color: transparent;
+}
+/* 滑块更粗、圆角更明显 */
+.scroll-pane .scroll-bar:vertical .thumb,
+.scroll-pane .scroll-bar:horizontal .thumb {
+    -fx-background-color: #BBDEFB;
+    -fx-background-radius: 7px;
+}
+.scroll-pane .scroll-bar:vertical .thumb:hover,
+.scroll-pane .scroll-bar:horizontal .thumb:hover {
+    -fx-background-color: #90CAF9;
+}
+/* 上下/左右箭头占位清零，避免占用空间 */
+.scroll-pane .scroll-bar:vertical .increment-button,
+.scroll-pane .scroll-bar:vertical .decrement-button,
+.scroll-pane .scroll-bar:horizontal .increment-button,
+.scroll-pane .scroll-bar:horizontal .decrement-button {
+    -fx-background-color: transparent;
+    -fx-padding: 0;
+    -fx-pref-height: 0;
+    -fx-max-height: 0;
+    -fx-min-height: 0;
+    -fx-pref-width: 0;
+    -fx-max-width: 0;
+    -fx-min-width: 0;
+}
