@@ -34,6 +34,13 @@
       <artifactId>javafx-media</artifactId>
       <version>${javafx.version}</version>
     </dependency>
+    <!-- WebView：Folia 全屏歌词视觉 -->
+    <dependency>
+      <groupId>org.openjfx</groupId>
+      <artifactId>javafx-web</artifactId>
+      <version>${javafx.version}</version>
+      <classifier>win</classifier>
+    </dependency>
     <!-- JNA：Windows 下设置 WS_EX_TRANSPARENT 让悬浮窗整窗（含文字）完全点击穿透 -->
     <dependency>
       <groupId>net.java.dev.jna</groupId>

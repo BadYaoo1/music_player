@@ -1,0 +1,396 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>Folia · Fullscreen Lyrics</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: #08081a; font-family: -apple-system, "Inter", "Noto Sans SC", system-ui, sans-serif; }
+
+  /* ===== Canvas 2D 粒子（精简 80 颗 · 30fps · 纯圆点） ===== */
+  #canvas { position: fixed; inset: 0; z-index: 1; pointer-events: none; }
+
+  /* ===== 封面 ===== */
+  #cover-bg {
+    position: fixed; inset: 0; z-index: 2;
+    background-size: cover; background-position: center;
+    filter: blur(80px) brightness(0.22) saturate(1.4);
+    transform: scale(1.2); opacity: 0; transition: opacity 1.4s ease;
+  }
+  #cover-bg.show { opacity: 1; }
+
+  #cover-front {
+    position: fixed; top: 50%; left: 8%; z-index: 5;
+    width: 240px; height: 240px; border-radius: 16px;
+    background-size: cover; background-position: center;
+    box-shadow: 0 25px 70px rgba(0,0,0,0.7), 0 0 50px rgba(255,255,255,0.06);
+    transform: translateY(-50%);
+    opacity: 0; transition: opacity 0.8s ease, transform 1.2s cubic-bezier(.2,.8,.2,1);
+  }
+  #cover-front.show { opacity: 0.9; transform: translateY(-50%) rotate(-1deg); }
+
+  #meta {
+    position: fixed; bottom: 20%; left: calc(8% + 280px); z-index: 5;
+    color: #fff; opacity: 0; transition: opacity 0.8s ease;
+    text-shadow: 0 2px 20px rgba(0,0,0,0.9);
+  }
+  #meta.show { opacity: 1; }
+  #title { font-size: 20px; font-weight: 600; letter-spacing: 0.5px; margin-bottom: 4px; }
+  #artist { font-size: 13px; font-weight: 300; color: rgba(255,255,255,0.5); letter-spacing: 1.5px; }
+
+  /* ===== Folia 风格：逐词发光歌词 ===== */
+  #lyrics-stage {
+    position: fixed; top: 0; left: 0; width: 100%; height: 80%;
+    z-index: 10; display: flex; align-items: center; justify-content: center;
+    pointer-events: none; perspective: 1200px;
+  }
+  #lyrics-line {
+    display: flex; flex-wrap: wrap; justify-content: center;
+    align-items: center; gap: 0;
+    max-width: 80%; padding: 2rem;
+    font-weight: 700; color: rgba(255,255,255,0.2);
+    font-size: clamp(2rem, 5vw, 4rem);
+    line-height: 1.5;
+    transform-origin: center;
+    transition: opacity 0.3s ease;
+  }
+
+  /* 每个词的发光效果（多层 text-shadow 叠加，Folia 经典风格） */
+  .word {
+    display: inline-block; white-space: pre;
+    transition: all 0.45s cubic-bezier(.2,.8,.2,1);
+    transform-origin: center;
+    padding: 0 0.35rem;
+  }
+
+  /* waiting 状态：暗 */
+  .word.waiting {
+    color: rgba(255,255,255,0.18);
+    text-shadow: none;
+    transform: scale(0.95);
+  }
+
+  /* active 状态：发光（Folia 核心效果） */
+  .word.active {
+    color: #fff;
+    text-shadow:
+      0 0 8px rgba(255,255,255,0.9),
+      0 0 20px rgba(180,200,255,0.7),
+      0 0 40px rgba(140,160,255,0.5),
+      0 0 80px rgba(100,120,255,0.3);
+    transform: scale(1.12) translateY(-2px);
+  }
+
+  /* passed 状态：微亮 + 后移 */
+  .word.passed {
+    color: rgba(255,255,255,0.55);
+    text-shadow: 0 0 10px rgba(200,210,255,0.3);
+    transform: scale(1.0) translateY(0);
+  }
+
+  /* 底部 upcoming 字幕 */
+  #subtitle-bottom {
+    position: fixed; bottom: 40px; left: 0; right: 0; z-index: 11;
+    text-align: center; pointer-events: none;
+  }
+  .subtitle-line {
+    font-size: 14px; font-weight: 400; letter-spacing: 1px;
+    color: rgba(255,255,255,0.3);
+    transition: all 0.4s ease;
+  }
+  .subtitle-line.upcoming { color: rgba(255,255,255,0.12); font-size: 12px; }
+
+  /* 呼吸浮动动画（整行） */
+  @keyframes breathe {
+    0%, 100% { transform: translateY(0) scale(1); }
+    50% { transform: translateY(-12px) scale(1.015); }
+  }
+  #lyrics-line.breathing {
+    animation: breathe 8s ease-in-out infinite;
+  }
+
+  /* 退出按钮 + 版权 */
+  #exit-btn {
+    position: fixed; top: 20px; right: 24px; z-index: 9999;
+    width: 44px; height: 44px; border-radius: 50%;
+    background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.15);
+    color: rgba(255,255,255,0.7); font-size: 22px; font-weight: bold;
+    cursor: pointer; display: flex; align-items: center; justify-content: center;
+    transition: background 0.2s, transform 0.2s;
+  }
+  #exit-btn:hover { background: rgba(255,255,255,0.18); transform: scale(1.08); }
+
+  #credit {
+    position: fixed; bottom: 14px; right: 20px; z-index: 9999;
+    color: rgba(255,255,255,0.25); font-size: 11px; letter-spacing: 0.5px;
+    pointer-events: none;
+  }
+</style>
+</head>
+<body>
+  <canvas id="canvas"></canvas>
+  <div id="cover-bg"></div>
+  <div id="cover-front"></div>
+  <div id="meta"><div id="title">...</div><div id="artist">...</div></div>
+
+  <div id="lyrics-stage">
+    <div id="lyrics-line"></div>
+  </div>
+
+  <div id="subtitle-bottom"></div>
+
+  <button id="exit-btn" title="退出全屏 (Esc / 双击)">✕</button>
+  <div id="credit">Visuals inspired by Folia</div>
+
+<script>
+'use strict';
+
+// ===== Canvas 2D 粒子 =====
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+let W = 0, H = 0;
+function resize() {
+  W = canvas.width = window.innerWidth;
+  H = canvas.height = window.innerHeight;
+}
+resize();
+window.addEventListener('resize', resize);
+
+const COUNT = 80;
+const ps = new Array(COUNT);
+for (let i = 0; i < COUNT; i++) {
+  ps[i] = {
+    x: Math.random() * window.innerWidth,
+    y: Math.random() * window.innerHeight,
+    vx: (Math.random() - 0.5) * 0.3,
+    vy: (Math.random() - 0.5) * 0.3 - 0.15,
+    r: 0.6 + Math.random() * 2.0,
+    a: 0.3 + Math.random() * 0.5,
+    hue: 220 + Math.floor(Math.random() * 50)  // 蓝紫色调
+  };
+}
+
+let last = 0;
+function frame(now) {
+  requestAnimationFrame(frame);
+  if (now - last < 33) return;
+  last = now;
+
+  ctx.fillStyle = '#08081a';
+  ctx.fillRect(0, 0, W, H);
+
+  for (let i = 0; i < COUNT; i++) {
+    const p = ps[i];
+    p.x += p.vx; p.y += p.vy;
+    if (p.x < 0) p.x = W; if (p.x > W) p.x = 0;
+    if (p.y < 0) p.y = H; if (p.y > H) p.y = 0;
+
+    ctx.fillStyle = 'hsla(' + p.hue + ', 70%, 72%, ' + p.a + ')';
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, p.r, 0, 6.2832);
+    ctx.fill();
+  }
+}
+requestAnimationFrame(frame);
+
+// ===== 退出 =====
+document.getElementById('exit-btn').addEventListener('click', () => {
+  if (window.__foliaExit) window.__foliaExit();
+});
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && window.__foliaExit) window.__foliaExit();
+});
+document.addEventListener('dblclick', () => {
+  if (window.__foliaExit) window.__foliaExit();
+});
+
+// ===== Folia 风格逐词歌词引擎 =====
+const lineEl = document.getElementById('lyrics-line');
+const subtitleEl = document.getElementById('subtitle-bottom');
+let currentLyrics = [];
+let currentProgress = 0;
+let currentActiveIdx = -1;
+let currentActiveLineId = -1;   // 用来判断是否换了行
+let currentWordsActive = new Set();  // 当前行内哪些词是 active 状态
+
+/** 确定性伪随机（给定 seed 输出 [0,1)）—— Folia 用来给同一行固定随机 */
+function seededRandom(seed) {
+  const x = Math.sin(seed) * 10000;
+  return x - Math.floor(x);
+}
+
+/** 把一行中文本按字符（或空格分隔的词）切成数组 */
+function tokenizeLine(text) {
+  // 简单分词：非中文按空格切，中文逐字
+  const tokens = [];
+  let i = 0;
+  while (i < text.length) {
+    const ch = text[i];
+    // CJK 字符：单独一个 token
+    if (/[\u4e00-\u9fa5\u3040-\u30ff\uac00-\ud7af]/.test(ch)) {
+      tokens.push(ch);
+      i++;
+    } else if (ch === ' ') {
+      // 空格保留为 token（保证渲染时词之间有间距）
+      tokens.push(' ');
+      i++;
+    } else {
+      // 英文/数字连续合并为一个 token
+      let j = i;
+      while (j < text.length && !/[\u4e00-\u9fa5\u3040-\u30ff\uac00-\ud7af\s]/.test(text[j])) j++;
+      tokens.push(text.slice(i, j));
+      i = j;
+    }
+  }
+  return tokens;
+}
+
+/** 根据时间找出 active 行 + 行内词的激活分布（简化：整行同时亮） */
+function findActiveLine(progress) {
+  for (let i = 0; i < currentLyrics.length; i++) {
+    if (progress >= currentLyrics[i].start && progress < currentLyrics[i].end) return i;
+  }
+  if (currentLyrics.length > 0 && progress >= currentLyrics[currentLyrics.length-1].end) {
+    return currentLyrics.length - 1;
+  }
+  return -1;
+}
+
+/** 渲染一行（逐词 DOM + 状态动画） */
+function renderLine(lineIdx) {
+  if (lineIdx < 0 || lineIdx >= currentLyrics.length) {
+    lineEl.innerHTML = '';
+    currentActiveLineId = -1;
+    return;
+  }
+  const line = currentLyrics[lineIdx];
+  const lineId = line.start;  // 用时间戳做唯一 id
+
+  // 同一行不重建（只更新词的状态）
+  if (currentActiveLineId === lineId) {
+    updateWordStates(lineIdx);
+    return;
+  }
+  currentActiveLineId = lineId;
+
+  // 换行了 → 重建 DOM
+  const tokens = tokenizeLine(line.text || '');
+  const seed = line.start;
+  let html = '';
+  for (let i = 0; i < tokens.length; i++) {
+    const t = tokens[i];
+    if (t === ' ') { html += '<span style="width:0.8rem;display:inline-block"></span>'; continue; }
+
+    // 确定性随机属性（跟 Folia 一样，同一行每次渲染位置一样）
+    const rot = (seededRandom(seed + i * 3.1) - 0.5) * 10;   // -5° ~ 5°
+    const dy = (seededRandom(seed + i * 7.7) - 0.5) * 8;    // 轻微上下
+    const hueShift = seededRandom(seed + i * 2.3) * 30 - 15; // 颜色微偏
+
+    html += '<span class="word waiting" data-idx="' + i + '"'
+          + ' style="transform: rotate(' + rot.toFixed(2) + 'deg) translateY(' + dy.toFixed(1) + 'px);'
+          + ' --hue-shift:' + hueShift.toFixed(1) + ';">'
+          + escapeHtml(t) + '</span>';
+  }
+  lineEl.innerHTML = html;
+  lineEl.classList.add('breathing');
+
+  // 初始状态
+  currentWordsActive = new Set();
+  updateWordStates(lineIdx);
+}
+
+/** 更新当前行内所有词的状态（waiting → active → passed） */
+function updateWordStates(lineIdx) {
+  if (lineIdx < 0) return;
+  const line = currentLyrics[lineIdx];
+  const tokens = tokenizeLine(line.text || '');
+  const lineDuration = line.end - line.start;
+  const progressInLine = lineDuration > 0 ? (currentProgress - line.start) / lineDuration : 0;
+
+  // 简化：按时间线性点亮所有词（不做真正的逐词时间对齐，因为 Java 端只给整行时间）
+  const tokensTotal = tokens.filter(t => t !== ' ').length;
+  let wordsLit = Math.max(1, Math.floor(progressInLine * tokensTotal));
+
+  const wordEls = lineEl.querySelectorAll('.word');
+  let litCount = 0;
+  for (let i = 0; i < wordEls.length; i++) {
+    const el = wordEls[i];
+    if (tokens[i] === ' ') continue;
+
+    if (litCount < wordsLit) {
+      el.classList.remove('waiting', 'passed');
+      el.classList.add('active');
+    } else {
+      el.classList.remove('active', 'waiting');
+      el.classList.add('passed');
+    }
+    litCount++;
+  }
+}
+
+/** 渲染底部 upcoming 字幕 */
+function renderSubtitles(activeIdx) {
+  let html = '';
+  // 上一行（passed）
+  if (activeIdx >= 1) {
+    html += '<div class="subtitle-line">' + escapeHtml(currentLyrics[activeIdx - 1].text || '') + '</div>';
+  }
+  // 当前行在上方大歌词里已经渲染了，这里不再重复
+  // 下一行（upcoming）
+  if (activeIdx >= 0 && activeIdx + 1 < currentLyrics.length) {
+    html += '<div class="subtitle-line upcoming">' + escapeHtml(currentLyrics[activeIdx + 1].text || '') + '</div>';
+  }
+  subtitleEl.innerHTML = html;
+}
+
+function escapeHtml(s) {
+  const d = document.createElement('div'); d.textContent = s; return d.innerHTML;
+}
+
+// 每帧更新
+setInterval(() => {
+  const activeIdx = findActiveLine(currentProgress);
+  if (activeIdx !== currentActiveIdx) {
+    currentActiveIdx = activeIdx;
+    renderLine(activeIdx);
+    renderSubtitles(activeIdx);
+  } else if (activeIdx >= 0) {
+    // 同一行内只更新状态（轻量）
+    updateWordStates(activeIdx);
+  }
+}, 33);
+
+// ===== 封面 / 元信息 =====
+function setCoverImage(url) {
+  const bg = document.getElementById('cover-bg');
+  const front = document.getElementById('cover-front');
+  if (!url) { bg.classList.remove('show'); front.classList.remove('show'); return; }
+  bg.style.backgroundImage = 'url("' + url + '")';
+  front.style.backgroundImage = 'url("' + url + '")';
+  bg.classList.add('show');
+  front.classList.add('show');
+}
+function setMeta(title, artist) {
+  document.getElementById('title').textContent = title || '';
+  document.getElementById('artist').textContent = artist || '';
+  document.getElementById('meta').classList.add('show');
+}
+
+// ===== Java 桥接 =====
+window.__foliaAPI = {
+  setLyrics: function(jsonArray) {
+    try {
+      currentLyrics = typeof jsonArray === 'string' ? JSON.parse(jsonArray) : jsonArray;
+      currentActiveIdx = -1;
+      currentActiveLineId = -1;
+    } catch(e) { console.error('setLyrics error:', e); }
+  },
+  setProgress: function(seconds) { currentProgress = Number(seconds) || 0; },
+  setCover: function(url) { setCoverImage(url); },
+  setMeta: function(title, artist) { setMeta(title, artist); },
+};
+
+console.log('[Folia] per-word glow lyrics engine ready');
+</script>
+</body>
+</html>

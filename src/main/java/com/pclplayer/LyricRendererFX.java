@@ -1336,6 +1336,47 @@ public class LyricRendererFX extends Application {
         });
     }
 
+    /** 把任意字符串转成合法 JSON 字符串（转义所有 JSON 特殊字符） */
+    private static String jsonEscape(String s) {
+        if (s == null) return "";
+        StringBuilder out = new StringBuilder(s.length() + 4);
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            switch (c) {
+                case '\\': out.append("\\\\"); break;
+                case '"':  out.append("\\\""); break;
+                case '\n': out.append("\\n"); break;
+                case '\r': out.append("\\r"); break;
+                case '\t': out.append("\\t"); break;
+                case '\b': out.append("\\b"); break;
+                case '\f': out.append("\\f"); break;
+                default:
+                    if (c < 0x20) {
+                        out.append(String.format("\\u%04x", (int) c));
+                    } else {
+                        out.append(c);
+                    }
+            }
+        }
+        return out.toString();
+    }
+
+    /** 导出当前歌词为 JSON 数组（供 Folia WebView 等外部消费者使用） */
+    public static String getLyricsAsJson() {
+        StringBuilder sb = new StringBuilder("[");
+        boolean first = true;
+        for (LyricLine l : lines) {
+            if (!first) sb.append(",");
+            first = false;
+            sb.append("{\"text\":\"").append(jsonEscape(l.text)).append("\"");
+            sb.append(",\"start\":").append(l.start);
+            sb.append(",\"end\":").append(l.end);
+            sb.append("}");
+        }
+        sb.append("]");
+        return sb.toString();
+    }
+
     /** 暂停 B站音频（若正在播放）。 */
     public static void pauseAudio() { if (audioPlayer != null) audioPlayer.pause(); }
 

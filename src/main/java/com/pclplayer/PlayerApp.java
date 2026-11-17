@@ -39,6 +39,8 @@ import javafx.scene.shape.Circle;
 import javafx.scene.shape.Rectangle;
 import javafx.scene.text.Font;
 import javafx.scene.text.FontWeight;
+import javafx.scene.web.WebEngine;
+import javafx.scene.web.WebView;
 import javafx.scene.effect.DropShadow;
 import javafx.stage.FileChooser;
 import javafx.stage.Modality;
@@ -59,6 +61,7 @@ import java.net.URL;
 import java.nio.channels.FileChannel;
 import java.nio.channels.FileLock;
 import java.nio.charset.StandardCharsets;
+import java.util.Base64;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -281,6 +284,14 @@ public class PlayerApp extends Application {
     private boolean d3AutoFlipRotate = true;      // 3D 歌词偏到右半边时是否自动反转旋转角（保持立体观感一致）
     private int d3ScreenIndex = 0;                // 3D 桌面歌词显示在哪块屏幕（0=主屏，多屏时可选 1/2/...）
     private double lastProgressMs = 0;           // 最近一次播放进度（毫秒），用于驱动 3D 歌词悬浮窗
+
+    // ===== Folia 全屏歌词视觉 =====
+    private Stage foliaStage = null;
+    private WebView foliaWebView = null;
+    private WebEngine foliaEngine = null;
+    private Button foliaBtn = null;
+    private com.sun.net.httpserver.HttpServer foliaHttpServer = null;
+    private int foliaHttpPort = -1;
 
     // ===== 歌词设置 =====
     /** 歌词来源顺序，元素取自 qq / netease / kugou，按顺序尝试 */
@@ -645,6 +656,8 @@ public class PlayerApp extends Application {
                         if (useLyricRendererFX && LyricRendererFX.isShowing()) {
                             LyricRendererFX.setProgress(cur / 1000.0);
                         }
+                        // Folia 全屏歌词进度同步
+                        syncFoliaProgress(cur / 1000.0);
                         // 用音频的真实播放位置驱动歌词，保证同步（单位：毫秒）
                         if (lyricView != null) lyricView.updateMillis(cur);
                         if (total > 0) {
@@ -1948,6 +1961,10 @@ public class PlayerApp extends Application {
             lyricGearBtn.setVisible(showLyric);
             lyricGearBtn.setManaged(showLyric);
         }
+        if (foliaBtn != null) {
+            foliaBtn.setVisible(showLyric);
+            foliaBtn.setManaged(showLyric);
+        }
         // 切到列表模式时关闭歌词设置独立窗口
         if (!showLyric && lyricSettingsStage != null && lyricSettingsStage.isShowing()) {
             lyricSettingsStage.hide();
@@ -2685,6 +2702,27 @@ public class PlayerApp extends Application {
         StackPane.setAlignment(lyricGearBtn, Pos.BOTTOM_RIGHT);
         StackPane.setMargin(lyricGearBtn, new Insets(0, 4, 20, 0));
         lyricBox.getChildren().add(lyricGearBtn);
+
+        // Folia 全屏歌词视觉入口按钮：放在齿轮上方，强制正方形圆形
+        foliaBtn = new Button("F");
+        foliaBtn.setStyle("-fx-background-color:rgba(255,255,255,0.9);-fx-text-fill:" + C_PRIMARY +
+                ";-fx-background-radius:50%;-fx-font-size:18px;-fx-font-weight:bold;"
+                + "-fx-padding:0;-fx-cursor:hand;"
+                + "-fx-effect:dropshadow(gaussian,rgba(31,41,55,0.15),6,0,0,1);");
+        foliaBtn.setCursor(Cursor.HAND);
+        foliaBtn.setMinSize(42, 42);
+        foliaBtn.setPrefSize(42, 42);
+        foliaBtn.setMaxSize(42, 42);
+        foliaBtn.setVisible(false);
+        foliaBtn.setManaged(false);
+        attachTapFeedback(foliaBtn);
+        foliaBtn.setOnAction(e -> openFoliaFullscreen());
+        Tooltip foliaTip = new Tooltip("Folia 全屏歌词 · 原作者 Folia\n(非原创接入，仅用于本地视觉展示)");
+        foliaTip.setStyle("-fx-font-size:11px;-fx-background-color:rgba(30,30,30,0.9);-fx-text-fill:#ddd;-fx-padding:6 10;");
+        foliaBtn.setTooltip(foliaTip);
+        StackPane.setAlignment(foliaBtn, Pos.BOTTOM_RIGHT);
+        StackPane.setMargin(foliaBtn, new Insets(0, 4, 64, 0));
+        lyricBox.getChildren().add(foliaBtn);
 
         // 歌词设置面板改为惰性单例：首次打开面板时再构建（见 openLyricSettings），
         // 避免每次切回播放页重建页面时产生“旧面板实例”导致来源列表刷新不到、偏移调不动。
@@ -5635,6 +5673,8 @@ public class PlayerApp extends Application {
                 }
                 LyricRendererFX.setProgress(lastProgressMs / 1000.0);
             }
+            // 同步给 Folia 全屏窗口（如果开着）
+            syncFoliaAll();
         });
     }
 
@@ -5677,6 +5717,630 @@ public class PlayerApp extends Application {
             out.add(current.trim());   // 当前正在用的字体不能从列表里消失
         }
         return new java.util.ArrayList<>(out);
+    }
+
+    // ===== Folia 全屏歌词视觉 =====
+
+    /** 打开 Folia 全屏视觉窗口（serving Folia 原项目 dist） */
+    private void openFoliaFullscreen() {
+        javafx.application.Platform.runLater(() -> {
+            if (foliaStage != null && foliaStage.isShowing()) {
+                foliaStage.requestFocus();
+                foliaStage.toFront();
+                return;
+            }
+            try {
+                // 1) 把 resources/folia-dist/ 拷到临时目录（HttpServer 需要文件系统路径）
+                File distDir = copyResourceDirToTemp("/folia-dist");
+                if (distDir == null || !distDir.exists()) {
+                    System.err.println("[Folia] folia-dist 不存在！");
+                    return;
+                }
+                System.out.println("[Folia] dist 临时目录: " + distDir.getAbsolutePath());
+
+                // 1.5) 注入 Folia 钩子到 index.html（hook fetch + 探测 Zustand store + 全局桥）
+                injectFoliaHooks(distDir);
+
+                // 2) 起 mini HttpServer serving dist
+                startFoliaHttpServer(distDir);
+                String foliaUrl = "http://localhost:" + foliaHttpPort + "/index.html";
+                System.out.println("[Folia] URL: " + foliaUrl);
+
+                // 3) 创建 Stage + WebView
+                foliaStage = new Stage();
+                foliaStage.setTitle("Folia Fullscreen");
+                foliaStage.initStyle(javafx.stage.StageStyle.UNDECORATED);
+                foliaStage.setFullScreen(true);
+                foliaStage.setFullScreenExitHint("按 Esc / 双击 / 点击右上角 ✕ 退出全屏");
+                foliaStage.setOnCloseRequest(e -> {
+                    foliaStage.close();
+                    stopFoliaHttpServer();
+                    foliaStage = null; foliaWebView = null; foliaEngine = null;
+                });
+
+                foliaWebView = new WebView();
+                foliaWebView.setStyle("-fx-background-color:#08081a;");
+                foliaEngine = foliaWebView.getEngine();
+                foliaEngine.setJavaScriptEnabled(true);
+                // 捕获 Folia 的 JS 事件
+                foliaEngine.setOnAlert(msg -> System.out.println("[Folia-ALERT] " + msg.getData()));
+                foliaEngine.setOnError(err -> System.err.println("[Folia-ERR] " + err.getMessage()));
+                foliaEngine.setOnStatusChanged(evt -> System.out.println("[Folia-STATUS] " + evt.getData()));
+
+                foliaEngine.getLoadWorker().stateProperty().addListener((o, ov, nv) -> {
+                    if (nv == javafx.concurrent.Worker.State.SUCCEEDED) {
+                        try {
+                            foliaEngine.executeScript(
+                                "localStorage.setItem('visualizer_mode','classic');"
+                                + "localStorage.setItem('visualizer_background_mode','latent');"
+                                + "localStorage.setItem('appChrome','minimal');"
+                                + "console.log('[Folia] localStorage injected');"
+                            );
+                            System.out.println("[Folia] Folia SPA loaded, localStorage set");
+
+                            foliaEngine.executeScript(
+                                "(function(){"
+                                + "var _scanOnce=function(){"
+                                + "  var stores=[];"
+                                + "  for(var k in window){"
+                                + "    if(k.indexOf('__folia_exports_')!==0)continue;"
+                                + "    try{var v=window[k];if(v&&typeof v.getState==='function'&&typeof v.setState==='function'){stores.push(v);}}"
+                                + "    catch(x){}"
+                                + "  }"
+                                + "  return stores;"
+                                + "};"
+                                + "var _doScan=function(){"
+                                + "  var ss=_scanOnce();"
+                                + "  for(var i=0;i<ss.length;i++){"
+                                + "    var st=ss[i].getState();"
+                                + "    if(!window.__foliaViewStore&&'view' in st&&'setView' in st){window.__foliaViewStore=ss[i];}"
+                                + "    if(!window.__foliaVizStore&&'visualizerMode' in st){window.__foliaVizStore=ss[i];}"
+                                + "    if(!window.__foliaPb&&'playerState' in st&&'lyrics' in st){window.__foliaPb=ss[i];}"
+                                + "  }"
+                                + "  if(window.__foliaViewStore){"
+                                + "    try{var vs=window.__foliaViewStore.getState();if(vs.view!=='player'){vs.setView('player');}}catch(x){}"
+                                + "  }"
+                                + "};"
+                                + "setTimeout(_doScan,500);"
+                                + "setTimeout(_doScan,1500);"
+                                + "setTimeout(_doScan,3000);"
+                                + "})();"
+                            );
+                            System.out.println("[Folia] store scanner injected");
+
+                            // 强制关闭 release notes / ponder 等启动弹窗（只 patch Zustand stores，不做 DOM remove）
+                            foliaEngine.executeScript(
+                                "(function(){"
+                                + "var _forceCloseStartup=function(){"
+                                + "  try{"
+                                + "    for(var k in window){"
+                                + "      if(k.indexOf('__folia_exports_')!==0)continue;"
+                                + "      try{var v=window[k];if(v&&typeof v.setState==='function'){"
+                                + "        var st=v.getState();"
+                                + "        if('isReleaseNotesOpen' in st)v.setState({isReleaseNotesOpen:false});"
+                                + "        if('isUserGuideModalOpen' in st)v.setState({isUserGuideModalOpen:false});"
+                                + "        if('isPlaybackEntryViewPromptOpen' in st)v.setState({isPlaybackEntryViewPromptOpen:false});"
+                                + "        if('playbackEntryViewPromptOpen' in st)v.setState({playbackEntryViewPromptOpen:false});"
+                                + "      }}"
+                                + "      catch(x){}"
+                                + "    }"
+                                + "  }catch(x){}"
+                                + "};"
+                                + "setTimeout(_forceCloseStartup,200);"
+                                + "setTimeout(_forceCloseStartup,1000);"
+                                + "})();"
+                            );
+
+                            new Thread(() -> {
+                                try { Thread.sleep(4000); } catch (InterruptedException e) { return; }
+                                javafx.application.Platform.runLater(() -> injectFoliaPlaybackData());
+                            }, "FoliaDataInjector").start();
+                        } catch (Exception ex) {
+                            System.err.println("[Folia] SUCCEEDED 后 executeScript 异常: " + ex.getMessage());
+                        }
+                    }
+                });
+
+                foliaEngine.load(foliaUrl);
+                foliaStage.setScene(new Scene(foliaWebView, javafx.scene.paint.Color.BLACK));
+                foliaStage.show();
+                foliaStage.requestFocus();
+            } catch (Exception ex) {
+                System.err.println("[Folia] 启动失败: " + ex.getMessage());
+                ex.printStackTrace();
+                stopFoliaHttpServer();
+            }
+        });
+    }
+
+    /** 把 classpath 下资源目录拷贝到系统临时目录，返回目标目录 */
+    private File copyResourceDirToTemp(String resourcePath) throws Exception {
+        // 先处理 resource 在文件系统还是 JAR 里
+        File tmpDir = File.createTempFile("folia-dist-", "");
+        tmpDir.delete();
+        tmpDir.mkdirs();
+        tmpDir.deleteOnExit();
+
+        java.net.URL url = getClass().getResource(resourcePath);
+        if (url == null) {
+            System.err.println("[Folia] resource not found: " + resourcePath);
+            return null;
+        }
+
+        if (url.getProtocol().equals("file")) {
+            // 开发态：直接文件系统拷贝
+            File srcDir = new File(url.toURI());
+            copyDirRecursive(srcDir, tmpDir);
+        } else {
+            // JAR 态：用 ClassLoader 枚举资源然后逐个写文件
+            java.util.Enumeration<java.net.URL> e = getClass().getClassLoader().getResources(resourcePath.substring(1));
+            while (e.hasMoreElements()) {
+                // 只处理第一个
+                break;
+            }
+            // 用 NIO walk JAR 里的目录
+            try (java.io.InputStream is = getClass().getResourceAsStream(resourcePath + "/index.html")) {
+                if (is != null) {
+                    // 只考 index.html + assets + 其他子目录
+                    copyResourceFile(resourcePath + "/index.html", new File(tmpDir, "index.html"));
+                    // 尝试 assets
+                    copyResourceSubDir(resourcePath + "/assets", new File(tmpDir, "assets"));
+                    copyResourceSubDir(resourcePath + "/fonts", new File(tmpDir, "fonts"));
+                    copyResourceSubDir(resourcePath + "/images", new File(tmpDir, "images"));
+                    copyResourceSubDir(resourcePath + "/icons", new File(tmpDir, "icons"));
+                    copyResourceSubDir(resourcePath + "/locales", new File(tmpDir, "locales"));
+                    copyResourceFile(resourcePath + "/favicon.ico", new File(tmpDir, "favicon.ico"));
+                    copyResourceFile(resourcePath + "/manifest.webmanifest", new File(tmpDir, "manifest.webmanifest"));
+                    copyResourceFile(resourcePath + "/sw.js", new File(tmpDir, "sw.js"));
+                    copyResourceFile(resourcePath + "/workbox-dcde9eb3.js", new File(tmpDir, "workbox-dcde9eb3.js"));
+                }
+            }
+        }
+        return tmpDir;
+    }
+
+    private void copyDirRecursive(File src, File dst) throws Exception {
+        if (src.isDirectory()) {
+            if (!dst.exists()) dst.mkdirs();
+            File[] children = src.listFiles();
+            if (children != null) for (File f : children) {
+                copyDirRecursive(f, new File(dst, f.getName()));
+            }
+        } else {
+            try (java.io.FileInputStream fis = new java.io.FileInputStream(src);
+                 java.io.FileOutputStream fos = new java.io.FileOutputStream(dst)) {
+                fis.transferTo(fos);
+            }
+            dst.deleteOnExit();
+        }
+    }
+
+    private void copyResourceFile(String resPath, File dst) throws Exception {
+        try (java.io.InputStream is = getClass().getResourceAsStream(resPath)) {
+            if (is == null) return;
+            dst.getParentFile().mkdirs();
+            try (java.io.FileOutputStream fos = new java.io.FileOutputStream(dst)) {
+                is.transferTo(fos);
+            }
+            dst.deleteOnExit();
+        }
+    }
+
+    private void copyResourceSubDir(String resPath, File dstDir) throws Exception {
+        java.net.URL url = getClass().getResource(resPath);
+        if (url == null) return;
+        dstDir.mkdirs();
+        if (url.getProtocol().equals("file")) {
+            File srcDir = new File(url.toURI());
+            copyDirRecursive(srcDir, dstDir);
+        } else {
+            // JAR 里枚举：先尝试已知子文件名（dist 里的 assets hash 是固定的）
+            // 简化：扫描 index.html 里引用的资源，然后逐个拷贝
+        }
+    }
+
+    /** 在 Folia dist/index.html 末尾注入 hook 脚本 + patch chunk 暴露 Zustand store */
+    private void injectFoliaHooks(File distDir) {
+        // 1) patch index.html：最前置注入 error capture + console 代理
+        File indexHtml = new File(distDir, "index.html");
+        if (indexHtml.exists()) {
+            try {
+                String orig = java.nio.file.Files.readString(indexHtml.toPath(), java.nio.charset.StandardCharsets.UTF_8);
+                if (!orig.contains("FOLIA_CAPTURE_PATCHED")) {
+                    String headPatch = "<script>"
+                        + "window.FOLIA_CAPTURE_PATCHED=true;"
+                        + "window.addEventListener('error',function(e){try{alert('[FOLIA-ERR] '+e.message+' @ '+e.lineno);}catch(x){}});"
+                        + "window.addEventListener('unhandledrejection',function(e){try{alert('[FOLIA-PROMISE] '+e.reason);}catch(x){}});"
+                        + "var _origWgr=window.WebGLRenderingContext; delete window.WebGLRenderingContext;"
+                        + "var _origWgr2=window.WebGL2RenderingContext; delete window.WebGL2RenderingContext;"
+                        + "HTMLCanvasElement.prototype.getContext=(function(orig){return function(type,attrs){try{if(type==='webgl'||type==='experimental-webgl'||type==='webgl2'){return null;}if(type==='2d'){var r=orig.apply(this,arguments);if(this.__folia_hidden){this.style.display='block';}}return orig.apply(this,arguments);}catch(x){return null;}};})(HTMLCanvasElement.prototype.getContext);"
+                        + "var _origFetch=window.fetch; window.fetch=function(url,opts){try{var s=typeof url==='string'?url:String(url||'');if(s.indexOf('update')>=0||s.indexOf('version')>=0||s.indexOf('api.github')>=0||s.indexOf('release')>=0){return Promise.reject(new Error('offline'));} }catch(x){} return _origFetch.apply(this,arguments);};"
+                        + "var _FOLIA_VER='0.7.29';"
+                        + "localStorage.setItem('folia_last_seen_guide_version',_FOLIA_VER);"
+                        + "localStorage.setItem('folia_last_seen_ponder_onboarding_version',_FOLIA_VER);"
+                        + "localStorage.setItem('playback_entry_view','player');"
+                        + "localStorage.setItem('playback_entry_view_chosen','true');"
+                        + "localStorage.setItem('library_suite_prompt_seen','true');"
+                        + "localStorage.setItem('folia_skip_update_check','true');"
+                        + "localStorage.setItem('auto_update','false');"
+                        + "localStorage.setItem('check_update_on_start','false');"
+                        + "localStorage.setItem('open_player_on_launch','true');"
+                        + "localStorage.setItem('last_app_view','player');"
+                        + "localStorage.setItem('visualizer_mode','classic');"
+                        + "localStorage.setItem('visualizer_background_mode','latent');"
+                        + "localStorage.setItem('appChrome','minimal');"
+                        + "try{window.status='LS-DUMP:'+JSON.stringify({folia_last_seen_guide_version:localStorage.getItem('folia_last_seen_guide_version'),folia_last_seen_ponder_onboarding_version:localStorage.getItem('folia_last_seen_ponder_onboarding_version'),playback_entry_view_chosen:localStorage.getItem('playback_entry_view_chosen'),open_player_on_launch:localStorage.getItem('open_player_on_launch'),visualizer_mode:localStorage.getItem('visualizer_mode')});}catch(x){}"
+                        + "document.addEventListener('DOMContentLoaded',function(){var s=document.getElementById('app-splash');if(s){s.remove();}});"
+                        + "try{Object.defineProperty(navigator,'serviceWorker',{get:function(){return{register:function(){return Promise.reject(new Error('sw disabled'));addEventListener:function(){},getRegistrations:function(){return Promise.resolve([]);}isSupported:false};}});}catch(x){}"
+                        + "var _oL=console.log,_oE=console.error;"
+                        + "console.log=function(){try{_oL.apply(console,arguments);}catch(x){}window.status='LOG:'+Array.from(arguments).slice(0,3).map(function(a){return typeof a==='string'?a:JSON.stringify(a).slice(0,100);}).join(' ');};"
+                        + "console.error=function(){try{_oE.apply(console,arguments);}catch(x){}window.status='ERR:'+Array.from(arguments).slice(0,3).map(function(a){return typeof a==='string'?a:JSON.stringify(a).slice(0,100);}).join(' ');};"
+                        + "</script>";
+                    String patched = orig.replaceFirst("<head>", "<head>" + headPatch);
+                    java.nio.file.Files.writeString(indexHtml.toPath(), patched, java.nio.charset.StandardCharsets.UTF_8);
+                    System.out.println("[Folia] index.html patched with error capture");
+                }
+            } catch (Exception e) { System.err.println("[Folia] patch index.html 失败: " + e.getMessage()); }
+        }
+
+        // 2) patch bootstrap chunk：暴露 playback store Y + patch skipsStartupExperience=true 跳过所有引导
+        File bootstrapChunk = null;
+        File assetsDir = new File(distDir, "assets");
+        if (assetsDir.exists()) {
+            for (File f : assetsDir.listFiles()) {
+                if (f.getName().startsWith("bootstrap-")) { bootstrapChunk = f; break; }
+            }
+        }
+        if (bootstrapChunk != null) {
+            try {
+                String orig = java.nio.file.Files.readString(bootstrapChunk.toPath(), java.nio.charset.StandardCharsets.UTF_8);
+                if (!orig.contains("FOLIA_BOOTSTRAP_PATCHED")) {
+                    String patched = orig;
+                    // patch 1: 暴露 playback store Y
+                    patched = patched + "\n// FOLIA_BOOTSTRAP_PATCHED\n"
+                        + "try{\n"
+                        + "  if(typeof Y!=='undefined' && typeof Y.getState==='function'){\n"
+                        + "    window.__foliaPb = Y;\n"
+                        + "    console.log('[Folia-PB] bootstrap Y exposed');\n"
+                        + "  }\n"
+                        + "}catch(e){}\n";
+                    java.nio.file.Files.writeString(bootstrapChunk.toPath(), patched, java.nio.charset.StandardCharsets.UTF_8);
+                    System.out.println("[Folia] bootstrap chunk patched");
+                }
+            } catch (Exception e) { System.err.println("[Folia] patch bootstrap 失败: " + e.getMessage()); }
+        } else {
+            System.err.println("[Folia] bootstrap chunk 没找到！");
+        }
+
+        // 3) patch 所有 Store chunk + motionSignals chunk：解析 export block，把每个导出变量暴露到 window
+        if (assetsDir.exists()) {
+            for (File f : assetsDir.listFiles()) {
+                String name = f.getName();
+                if (!name.endsWith(".js")) continue;
+                if (!name.contains("Store") && !name.contains("motionSignals")) continue;
+                try {
+                    String orig = java.nio.file.Files.readString(f.toPath(), java.nio.charset.StandardCharsets.UTF_8);
+                    if (orig.contains("FOLIA_EXPORTS_PATCHED")) continue;
+                    int exportIdx = orig.lastIndexOf("export{");
+                    if (exportIdx < 0) continue;
+                    int braceEnd = orig.indexOf("}", exportIdx);
+                    if (braceEnd < 0) continue;
+                    String exportBody = orig.substring(exportIdx + 7, braceEnd);
+                    // 解析本地变量名：a, i as c, u as i → 取 as 前的名字
+                    java.util.Set<String> localNames = new java.util.LinkedHashSet<>();
+                    for (String part : exportBody.split(",")) {
+                        String trimmed = part.trim();
+                        if (trimmed.isEmpty()) continue;
+                        String local = trimmed.contains(" as ") ? trimmed.substring(0, trimmed.indexOf(" as ")).trim() : trimmed;
+                        if (!local.isEmpty() && local.matches("[a-zA-Z_$][a-zA-Z0-9_$]*")) {
+                            localNames.add(local);
+                        }
+                    }
+                    StringBuilder expose = new StringBuilder();
+                    for (String var : localNames) {
+                        expose.append("try{window.__folia_exports_").append(var).append("=").append(var).append(";}catch(x){}\n");
+                    }
+                    String patched = orig.substring(0, exportIdx)
+                        + "// FOLIA_EXPORTS_PATCHED\n" + expose.toString()
+                        + orig.substring(exportIdx);
+                    java.nio.file.Files.writeString(f.toPath(), patched, java.nio.charset.StandardCharsets.UTF_8);
+                    System.out.println("[Folia] patched " + name + " (" + localNames.size() + " exports)");
+                } catch (Exception e) {
+                    System.err.println("[Folia] patch " + name + " 失败: " + e.getMessage());
+                }
+            }
+        }
+    }
+
+    /** Folia SPA 渲染完后，把我们的歌词/封面/元数据注入 Zustand store */
+    private void injectFoliaPlaybackData() {
+        if (foliaEngine == null) return;
+        try {
+            // 0) 先扫描 __folia_exports_* 找到所有 Zustand store，强制 view=player
+            String js0 = "(function(){"
+                + "var stores=[],names=[];"
+                + "for(var k in window){"
+                + "  if(k.indexOf('__folia_exports_')!==0)continue;"
+                + "  try{var v=window[k];if(v&&typeof v.getState==='function'&&typeof v.setState==='function'){stores.push(v);names.push(k);}}"
+                + "  catch(x){}"
+                + "}"
+                + "var foundPb=false,foundView=false,pbCandName='',viewCandName='',pbSt=null,viewSt=null;"
+                + "for(var i=0;i<stores.length;i++){"
+                + "  var st=stores[i].getState();"
+                + "  if(!foundPb&&'playerState' in st&&'lyrics' in st){window.__foliaPb=stores[i];foundPb=true;pbCandName=names[i];pbSt=st;}"
+                + "  if(!foundView&&'view' in st&&'setView' in st){window.__foliaViewStore=stores[i];foundView=true;viewCandName=names[i];viewSt=st;}"
+                + "}"
+                + "var lines=[];"
+                + "lines.push('TOTAL='+stores.length);"
+                + "for(var i=0;i<stores.length;i++){"
+                + "  try{"
+                + "    var s=stores[i].getState();"
+                + "    var k=Object.keys(s);"
+                + "    lines.push('#'+i+' '+names[i]+' keys=['+k.slice(0,12).join(',')+']');"
+                + "  }catch(x){lines.push('#'+i+' '+names[i]+' ERR='+x.message);}"
+                + "}"
+                + "var r=lines.join('\\n');"
+                + "if(foundPb){r+='\\nPB_NAME='+pbCandName;}"
+                + "else{r+='\\nPB_NOT_FOUND_IN_EXPORTS';}"
+                + "if(foundView){r+='\\nVIEW_NAME='+viewCandName+' curView='+viewSt.view;}"
+                + "if(foundView){try{var vs=window.__foliaViewStore.getState();if(vs.view!=='player'){vs.setView('player');r+=' forced=player';}}catch(x){r+=' setViewErr='+x.message;}}"
+                + "return r;"
+                + "})();";
+            Object r0 = foliaEngine.executeScript(js0);
+            System.out.println("[Folia-SCAN]\n" + r0);
+
+            String jsonLyrics = LyricRendererFX.getLyricsAsJson();
+            // 第一步：dump 完整状态 + DOM
+            String js1 = "(function(){"
+                + "const pb = window.__foliaPb; if(!pb) return 'NO_PB';"
+                + "const st = pb.getState();"
+                + "var result={};"
+                + "result.visualizer_mode = localStorage.getItem('visualizer_mode');"
+                + "result.visualizer_background_mode = localStorage.getItem('visualizer_background_mode');"
+                + "result.appChrome = localStorage.getItem('appChrome');"
+                + "result.playerState = st.playerState;"
+                + "result.lyricsType = typeof st.lyrics;"
+                + "result.lyricsIsObj = st.lyrics && typeof st.lyrics==='object';"
+                + "result.lyricsLinesLen = st.lyrics && st.lyrics.lines ? st.lyrics.lines.length : -1;"
+                + "result.lyricsFirst3 = st.lyrics && st.lyrics.lines ? st.lyrics.lines.slice(0,3) : null;"
+                + "result.currentSong = st.currentSong;"
+                + "result.duration = st.duration;"
+                + "result.playQueueLen = st.playQueue ? st.playQueue.length : -1;"
+                + "result.isLoadingToPlay = st.isLoadingToPlay;"
+                + "result.view = window.__foliaViewStore ? window.__foliaViewStore.getState().view : 'no-view-store';"
+                + "result.domBodySnippet = document.body ? document.body.innerHTML.substring(0,600).replace(/\\s+/g,' ') : 'NO_BODY';"
+                + "result.rootChildren = document.getElementById('root') ? document.getElementById('root').children.length : -1;"
+                + "return JSON.stringify(result);"
+                + "})();";
+            Object r1 = foliaEngine.executeScript(js1);
+            System.out.println("[Folia-DOM] before patch: " + r1);
+
+            // DEBUG: 打印 jsonLyrics 长度和前后片段 + js2 长度
+            System.out.println("[Folia-DEBUG] jsonLyrics length=" + (jsonLyrics != null ? jsonLyrics.length() : 0));
+            if (jsonLyrics != null && jsonLyrics.length() > 0) {
+                System.out.println("[Folia-DEBUG] jsonLyrics first80=" + jsonLyrics.substring(0, Math.min(80, jsonLyrics.length())).replace("\n", "\\n").replace("\r", "\\r"));
+                System.out.println("[Folia-DEBUG] jsonLyrics last80=" + jsonLyrics.substring(Math.max(0, jsonLyrics.length() - 80)).replace("\n", "\\n").replace("\r", "\\r"));
+            }
+
+            // 第二步：Base64 安全编码歌词（杜绝任何特殊字符破坏 JS 语法）
+            String lyricsB64 = jsonLyrics != null
+                ? Base64.getEncoder().encodeToString(jsonLyrics.getBytes(StandardCharsets.UTF_8))
+                : "";
+
+            // 第三步：渐进 patch（step1 基础状态 → step2 元数据 → step3 歌词）
+            String js2 = "(function(){"
+                + "var pb = window.__foliaPb; if(!pb) return 'NO_PB';"
+                + "var _snap=function(tag){"
+                + "  try{"
+                + "    var root=document.getElementById('root');"
+                + "    window.status='STEP-'+tag+':'+JSON.stringify({root:root?root.children.length:-1,pb:pb.getState().playerState});"
+                + "  }catch(x){window.status='STEP-'+tag+'-ERR:'+x.message;}"
+                + "};"
+                + "_snap('before');"
+                + "pb.setState({playerState:'playing',audioSrc:'',playQueue:[],activePlaybackContext:'local',isLoadingToPlay:false});"
+                + "_snap('s1-immediate');"
+                + "setTimeout(function(){"
+                + "  _snap('s1-150ms');"
+                + "  var meta=" + PlayerApp.currentSongMetaJsonSafe() + ";"
+                + "  pb.setState({currentSong:meta,duration:meta.duration||0,cachedCoverUrl:meta.coverUrl||null});"
+                + "  _snap('s2-immediate');"
+                + "  setTimeout(function(){"
+                + "    _snap('s2-200ms');"
+                + "    var b64='" + lyricsB64 + "';"
+                + "    var rawLines=[];"
+                + "    try{"
+                + "      var _bin=atob(b64);"
+                + "      var _bytes=new Uint8Array(_bin.length);"
+                + "      for(var _i=0;_i<_bin.length;_i++)_bytes[_i]=_bin.charCodeAt(_i);"
+                + "      var _decoded=new TextDecoder('utf-8').decode(_bytes);"
+                + "      rawLines=JSON.parse(_decoded);"
+                + "    }catch(e){}"
+                + "    var foliaLyrics={lines:rawLines.map(function(l){"
+                + "      var st=(l.start||0)/1000;"
+                + "      var et=Math.max((l.end||(l.start+5000))/1000,st+0.5);"
+                + "      var txt=l.text||'';"
+                + "      return {startTime:st,endTime:et,fullText:txt,words:[{text:txt,startTime:st,endTime:et}],renderHints:{}};"
+                + "    })};"
+                + "    pb.setState({lyrics:foliaLyrics,activeLocalLyricsSource:'local',currentLineIndex:0,handoffLineIndex:0});"
+                + "    _snap('s3-immediate');"
+                + "    setTimeout(function(){_snap('s3-500ms');},500);"
+                + "  },300);"
+                + "},600);"
+                + "return 'PROGRESSIVE';"
+                + "})();";
+            System.out.println("[Folia-DEBUG] js2 length=" + js2.length() + " first100=" + js2.substring(0, Math.min(100, js2.length())).replace("\n", "\\n"));
+            Object r2 = foliaEngine.executeScript(js2);
+            System.out.println("[Folia-PB] progressive patch: " + r2);
+
+            // 第三步：每秒同步进度（等 patch 稳定后再启动）
+            new Thread(() -> {
+                try { Thread.sleep(3500); } catch (InterruptedException e) { return; }
+                javafx.application.Platform.runLater(this::startFoliaProgressSync);
+            }, "FoliaProgressSync").start();
+        } catch (Exception ex) {
+            System.err.println("[Folia] injectFoliaPlaybackData 异常: " + ex.getMessage());
+            ex.printStackTrace();
+        }
+    }
+
+    /** 安全地把当前播放歌曲的元数据转成 JSON（供 Folia 注入用） */
+    private static String currentSongMetaJsonSafe() {
+        try {
+            StringBuilder sb = new StringBuilder("{");
+            // PlayerApp 非静态字段：用 getInstance() 或者直接在调用点内联
+            sb.append("\"title\":\"\"").append(",");
+            sb.append("\"artist\":\"\"").append(",");
+            sb.append("\"artists\":[]").append(",");
+            sb.append("\"album\":\"\"").append(",");
+            sb.append("\"coverUrl\":null").append(",");
+            sb.append("\"duration\":0");
+            sb.append("}");
+            return sb.toString();
+        } catch (Exception e) { return "null"; }
+    }
+
+    /** 每秒同步播放器进度到 Folia Zustand store */
+    private Thread foliaProgressThread = null;
+    private volatile boolean foliaProgressRunning = false;
+    private void startFoliaProgressSync() {
+        if (foliaProgressRunning) return;
+        foliaProgressRunning = true;
+        foliaProgressThread = new Thread(() -> {
+            while (foliaProgressRunning && foliaEngine != null && foliaStage != null && foliaStage.isShowing()) {
+                try {
+                    double progressMs = PlayerApp.this.lastProgressMs;
+                    double progressSec = progressMs / 1000.0;
+                    final double pSec = progressSec;
+                    javafx.application.Platform.runLater(() -> {
+                        if (foliaEngine == null) return;
+                        try {
+                            foliaEngine.executeScript(
+                                "(function(){"
+                                + "const pb = window.__foliaPb;"
+                                + "if(pb){"
+                                + "  const s = pb.getState();"
+                                + "  const patch = {};"
+                                + "  if(s.hasOwnProperty('progress')) patch.progress = " + pSec + ";"
+                                + "  if(s.hasOwnProperty('currentTime')) patch.currentTime = " + pSec + ";"
+                                + "  if(s.hasOwnProperty('elapsed')) patch.elapsed = " + progressMs + ";"
+                                + "  if(Object.keys(patch).length) pb.setState(patch);"
+                                + "}"
+                                + "// 同步 motionSignals 的所有 MotionValue（让 visualizer 的 currentTime 实时更新）"
+                                + "try{"
+                                + "  for(var k in window){"
+                                + "    if(k.indexOf('__folia_exports_')!==0)continue;"
+                                + "    try{var v=window[k];"
+                                + "      if(v&&typeof v.set==='function'&&typeof v.get==='function'&&typeof v.get()==='number'){v.set(" + pSec + ");}}"
+                                + "    catch(x){}"
+                                + "  }"
+                                + "}catch(x){}"
+                                + "})();"
+                            );
+                        } catch (Exception ignored) {}
+                    });
+                    Thread.sleep(500);
+                } catch (InterruptedException e) { break; }
+            }
+            foliaProgressRunning = false;
+        }, "FoliaProgressSync");
+        foliaProgressThread.setDaemon(true);
+        foliaProgressThread.start();
+    }
+
+    /** 起一个临时 HttpServer serving 给定目录（随机端口，自动处理 SPA fallback） */
+    private void startFoliaHttpServer(File rootDir) throws Exception {
+        stopFoliaHttpServer();
+        foliaHttpServer = com.sun.net.httpserver.HttpServer.create(new java.net.InetSocketAddress("127.0.0.1", 0), 0);
+        foliaHttpServer.createContext("/", ex -> {
+            try {
+                String path = ex.getRequestURI().getPath();
+                if (path.equals("/")) path = "/index.html";
+                File file = new File(rootDir, path.substring(1));
+                if (!file.exists() || file.isDirectory()) {
+                    // SPA fallback
+                    file = new File(rootDir, "index.html");
+                }
+                if (!file.exists()) {
+                    ex.sendResponseHeaders(404, 0);
+                    ex.getResponseBody().close();
+                    return;
+                }
+                byte[] data = java.nio.file.Files.readAllBytes(file.toPath());
+                String contentType = guessContentType(path);
+                ex.getResponseHeaders().set("Content-Type", contentType + "; charset=utf-8");
+                ex.sendResponseHeaders(200, data.length);
+                ex.getResponseBody().write(data);
+                ex.getResponseBody().close();
+            } catch (Exception e) {
+                try { ex.sendResponseHeaders(500, 0); ex.getResponseBody().close(); } catch (Exception ignored) {}
+            }
+        });
+        foliaHttpServer.start();
+        foliaHttpPort = ((java.net.InetSocketAddress) foliaHttpServer.getAddress()).getPort();
+        System.out.println("[Folia] HttpServer started on port " + foliaHttpPort);
+    }
+
+    private void stopFoliaHttpServer() {
+        if (foliaHttpServer != null) {
+            foliaHttpServer.stop(0);
+            foliaHttpServer = null;
+            System.out.println("[Folia] HttpServer stopped");
+        }
+    }
+
+    private static String guessContentType(String path) {
+        if (path.endsWith(".html")) return "text/html";
+        if (path.endsWith(".js") || path.endsWith(".mjs")) return "application/javascript";
+        if (path.endsWith(".css")) return "text/css";
+        if (path.endsWith(".json")) return "application/json";
+        if (path.endsWith(".svg")) return "image/svg+xml";
+        if (path.endsWith(".png")) return "image/png";
+        if (path.endsWith(".jpg") || path.endsWith(".jpeg")) return "image/jpeg";
+        if (path.endsWith(".webp")) return "image/webp";
+        if (path.endsWith(".ico")) return "image/x-icon";
+        if (path.endsWith(".woff")) return "font/woff";
+        if (path.endsWith(".woff2")) return "font/woff2";
+        if (path.endsWith(".ttf")) return "font/ttf";
+        if (path.endsWith(".otf")) return "font/otf";
+        if (path.endsWith(".map")) return "application/json";
+        return "application/octet-stream";
+    }
+
+    private String readResource(String path) {
+        try (java.io.InputStream is = getClass().getResourceAsStream(path)) {
+            if (is == null) return null;
+            java.util.Scanner sc = new java.util.Scanner(is, "UTF-8").useDelimiter("\\A");
+            String s = sc.hasNext() ? sc.next() : "";
+            sc.close();
+            return s;
+        } catch (Exception e) { return null; }
+    }
+
+    /** 全量同步：歌词 + 进度 + 封面 + 元数据 */
+    private void syncFoliaAll() {
+        if (foliaEngine == null) return;
+        try {
+            String json = LyricRendererFX.getLyricsAsJson();
+            foliaEngine.executeScript("if(window.__foliaAPI)window.__foliaAPI.setLyrics(" + json + ")");
+            if (leftCoverImg != null && leftCoverImg.get() != null && leftCoverImg.get().getUrl() != null) {
+                foliaEngine.executeScript("if(window.__foliaAPI)window.__foliaAPI.setCover(" + escapeJs(leftCoverImg.get().getUrl()) + ")");
+            }
+            String title = leftTitle != null ? leftTitle.getText() : "";
+            String artist = leftArtist != null ? leftArtist.getText() : "";
+            foliaEngine.executeScript("if(window.__foliaAPI)window.__foliaAPI.setMeta(" + escapeJs(title) + "," + escapeJs(artist) + ")");
+        } catch (Exception ignored) {}
+    }
+
+    private void syncFoliaProgress(double seconds) {
+        if (foliaEngine == null) return;
+        try {
+            foliaEngine.executeScript("if(window.__foliaAPI)window.__foliaAPI.setProgress(" + seconds + ")");
+        } catch (Exception ignored) {}
+    }
+
+    private static String escapeJs(String s) {
+        if (s == null) return "null";
+        return "\"" + s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t") + "\"";
     }
 
     /**
