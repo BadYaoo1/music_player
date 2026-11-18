@@ -6172,9 +6172,33 @@ public class PlayerApp extends Application {
             Object r2 = foliaEngine.executeScript(js2);
             System.out.println("[Folia-PB] progressive patch: " + r2);
 
-            // 第三步：每秒同步进度（等 patch 稳定后再启动）
+            // 同步验证：直接读 store state 确认 lyrics 真的进去了
+            try {
+                String verifyJs = "(function(){"
+                    + "var pb=window.__foliaPb; if(!pb) return 'NO_PB';"
+                    + "var s=pb.getState();"
+                    + "var ly=s.lyrics;"
+                    + "var lines=ly&&ly.lines?ly.lines:null;"
+                    + "var firstLine=lines&&lines[0]?lines[0]:null;"
+                    + "return JSON.stringify({"
+                    + "  hasLyrics:!!ly,"
+                    + "  linesLen:lines?lines.length:-1,"
+                    + "  firstLine:firstLine?{startTime:firstLine.startTime,endTime:firstLine.endTime,fullText:firstLine.fullText,hasWords:!!firstLine.words,wordsLen:firstLine.words?firstLine.words.length:0}:null,"
+                    + "  currentLineIndex:s.currentLineIndex,"
+                    + "  playerState:s.playerState,"
+                    + "  hasAudioSrc:!!s.audioSrc,"
+                    + "  playQueueLen:s.playQueue?s.playQueue.length:-1"
+                    + "});"
+                    + "})();";
+                Object verify = foliaEngine.executeScript(verifyJs);
+                System.out.println("[Folia-VERIFY] " + verify);
+            } catch (Exception ex) {
+                System.err.println("[Folia-VERIFY] 异常: " + ex.getMessage());
+            }
+
+            // 第三步：每秒同步进度（立即启动）
             new Thread(() -> {
-                try { Thread.sleep(3500); } catch (InterruptedException e) { return; }
+                try { Thread.sleep(800); } catch (InterruptedException e) { return; }
                 javafx.application.Platform.runLater(this::startFoliaProgressSync);
             }, "FoliaProgressSync").start();
         } catch (Exception ex) {
@@ -6202,6 +6226,7 @@ public class PlayerApp extends Application {
     /** 每秒同步播放器进度到 Folia Zustand store */
     private Thread foliaProgressThread = null;
     private volatile boolean foliaProgressRunning = false;
+    private int foliaProgressTick = 0;
     private void startFoliaProgressSync() {
         if (foliaProgressRunning) return;
         foliaProgressRunning = true;
@@ -6213,7 +6238,23 @@ public class PlayerApp extends Application {
                     final double pSec = progressSec;
                     javafx.application.Platform.runLater(() -> {
                         if (foliaEngine == null) return;
+                        foliaProgressTick++;
                         try {
+                            if (foliaProgressTick <= 3) {
+                                String diag = foliaEngine.executeScript(
+                                    "(function(){"
+                                    + "var mvs=[];"
+                                    + "for(var k in window){"
+                                    + "  if(k.indexOf('__folia_exports_')!==0)continue;"
+                                    + "  try{var v=window[k];"
+                                    + "    if(v&&typeof v.set==='function'&&typeof v.get==='function'&&typeof v.get()==='number'){mvs.push(k);}}"
+                                    + "  catch(x){}"
+                                    + "}"
+                                    + "return JSON.stringify({mvCount:mvs.length, mvKeys:mvs.slice(0,5)});"
+                                    + "})();"
+                                ).toString();
+                                System.out.println("[Folia-MV] tick#" + foliaProgressTick + " " + diag);
+                            }
                             foliaEngine.executeScript(
                                 "(function(){"
                                 + "const pb = window.__foliaPb;"
