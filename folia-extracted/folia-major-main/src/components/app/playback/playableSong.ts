@@ -8,11 +8,18 @@ import { isLocalPlaybackSong, isNavidromePlaybackSong } from '../../../utils/app
 // restore's. Both read the provider registry through omni, which is why they are not in
 // utils/playbackNeighbors.ts with the index rules.
 
+/** 宿主模式（Java 播放器内嵌，?host=1）：音频由 Java 提供，歌单里的 bvid 都能播。 */
+const isFoliaHostMode = () => typeof window !== 'undefined'
+    && new URLSearchParams(window.location.search).get('host') === '1';
+
 /**
  * The queue's check, for stepping past tracks that cannot play: local and Navidrome tracks always
  * pass; any other track passes when it is not marked unavailable and its provider can play it.
  */
 export const isQueueSongPlayable = (song: SongResult): boolean => {
+    if (isFoliaHostMode()) {
+        return true;
+    }
     if (isLocalPlaybackSong(song) || isNavidromePlaybackSong(song)) {
         return true;
     }

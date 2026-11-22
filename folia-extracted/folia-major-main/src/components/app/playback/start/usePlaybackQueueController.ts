@@ -79,6 +79,14 @@ import { hifiTransport, isHifiRoute } from '../../../../services/hifi/hifiPlayba
 
 // src/components/app/playback/start/usePlaybackQueueController.ts
 
+/**
+ * 宿主模式（Java 播放器内嵌，?host=1）：音频由 Java 下载并通过 /__audio 提供，
+ * Folia 只负责切歌与显示。此时不能走平台播放分支——注入的歌曲只有 bvid，
+ * 没有任何 online provider，playSong 会在 canPlaySong 处失败并保留旧歌。
+ */
+const isFoliaHostMode = () => typeof window !== 'undefined'
+    && new URLSearchParams(window.location.search).get('host') === '1';
+
 type SetState<T> = Dispatch<SetStateAction<T>>;
 
 type SearchDeps = {
@@ -591,6 +599,27 @@ export function usePlaybackQueueController({
             return;
         }
         const song = allowedSong;
+        // ---- 宿主模式：只切歌，音频交给 Java ----
+        // 注入的歌曲只有 bvid，没有 online provider，正常分支会在 canPlaySong 处失败、
+        // 保留旧歌继续播（这就是"切歌没反应"的根因）。这里直接写 store：
+        // 清空 audioSrc 停掉旧声音并置为播放中，切歌上报由 useHostSync 的 songId 差异检测
+        // 发出（POST songChange），Java 下载好后下一轮 poll 返回新的 audioSrc 再播放。
+        if (isFoliaHostMode()) {
+            const nextQueue = queue.length > 0 ? queue : usePlaybackStore.getState().playQueue;
+            if (nextQueue && nextQueue.length > 0) setPlayQueue(nextQueue as any);
+            setCurrentSong(song);
+            setDuration((song.durationMs ?? 0) / 1000);
+            if (song.album?.coverUrl) setCachedCoverUrl(song.album.coverUrl);
+            // 立刻停掉旧歌，不等 Java 下载完成
+            try {
+                const el = document.querySelector('audio[data-playback-deck]') as HTMLAudioElement | null;
+                if (el) el.pause();
+            } catch {}
+            setAudioSrc('');
+            setPlayerState(PlayerState.PLAYING);
+            console.log('[HostMode] playSong intercepted:', song.name, song.id);
+            return;
+        }
         // A pause still fading out belongs to the song being replaced. Run it now instead of
         // dropping it: the old song is still sounding and the new one can take seconds to load, so
         // dropping it would leave the old song at full volume under a PAUSED player. The fade node

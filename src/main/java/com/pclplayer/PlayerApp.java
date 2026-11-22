@@ -110,6 +110,7 @@ public class PlayerApp extends Application {
     private Rectangle leftCoverClip;
     private StackPane leftCoverFrame;
     private String leftCoverBvid = null;
+    private volatile String foliaCoverUrl = null;   // 当前曲目封面 URL，供 Folia 注入用（loadAndSetCover 时缓存）
     private final ObjectProperty<Image> leftCoverImg = new SimpleObjectProperty<>();
     private VBox leftInfo;                       // 左侧标题/歌手容器（切歌时淡入滑入）
     private Timeline coverBreathTl = null;       // 播放时封面缓慢"呼吸"动画
@@ -167,7 +168,7 @@ public class PlayerApp extends Application {
     private List<FavVideo> favRenderData = null;
     // 歌单页渲染批次号：每次重新渲染（切换收藏夹/命中缓存）都会自增。
     // 异步回调凭它判断自己是否已经过期，避免把上一个收藏夹的条目追加进当前列表
-    private int favRenderToken = 0;
+    private volatile int favRenderToken = 0;
     // 歌单页滚动懒加载监听。同一个 ScrollPane 会被多个收藏夹复用，重复绑定会让监听器累积
     private ChangeListener<Number> favScrollListener = null;
     // 歌单页 tab 切换批次号：连点时靠它作废尚未执行的旧淡出回调
@@ -243,15 +244,18 @@ public class PlayerApp extends Application {
     // 免责声明：首次启动弹窗，用户点"我同意"后置 true，不再显示
     private boolean disclaimerShown = false;
 
+    // Folia 首次全屏启动提示（退出全屏方式 + 原作者声明），确认一次后不再显示
+    private boolean foliaFullscreenTipShown = false;
+
     // 系统托盘：关闭主窗口时最小化到托盘而非退出（不支持时退化为直接退出）
     private boolean trayAvailable = false;
     private boolean trayExit = false;
     private java.awt.SystemTray systemTray = null;
     private java.awt.TrayIcon trayIcon = null;
     private Stage trayMenuStage = null;   // 点击托盘图标弹出的 JavaFX 菜单（绕过 AWT 原生菜单的中文方块问题）
-    private boolean trayPressHandled = false; // 右键“按下”是否已处理，防止松手二次触发
+    private boolean trayPressHandled = false; // 右键"按下"是否已处理，防止松手二次触发
     private VBox lyricSettingsPanel;
-    private Label lyricTitleLabel;       // 标题“歌词设置”，按背景自适应黑白
+    private Label lyricTitleLabel;       // 标题"歌词设置"，按背景自适应黑白
     private Label lyricOffsetLabel;
     private java.awt.Robot screenRobot;  // 用于采样标题背后屏幕像素，决定黑白
     private long lastContrastSample = 0; // 节流：避免每帧都截图
@@ -261,8 +265,8 @@ public class PlayerApp extends Application {
     private ScrollPane lyricSourceScroll;   // 「可选来源」列表滚动区（按主窗口高度自适应列表高度用）
     private double lyricSessionOffset = 0;   // 本次打开面板累计的偏移（秒）
     private String currentLyricQuery = null;  // 当前歌词对应的查询词（用于多来源拉取/保存）
-    private int lyricSourceFetchToken = 0;    // 拉取来源的请求序号，丢弃过期结果，避免“卡在加载中”
-    /** 各来源最近一次拉取到的候选列表：来源名 -> 候选歌曲；点“获取”只补某个来源后据此重绘 */
+    private int lyricSourceFetchToken = 0;    // 拉取来源的请求序号，丢弃过期结果，避免"卡在加载中"
+    /** 各来源最近一次拉取到的候选列表：来源名 -> 候选歌曲；点"获取"只补某个来源后据此重绘 */
     private Map<String, List<BiliUidLyricService.LyricCandidate>> lastCandidateMap;
     private GridPane mainContentCache;        // 播放页只构建一次，避免切回时重建 LyricView/设置面板导致状态错乱
     private boolean useLyricRendererFX = false;  // 是否启用 LyricRendererFX 3D 桌面歌词悬浮窗
@@ -292,6 +296,22 @@ public class PlayerApp extends Application {
     private Button foliaBtn = null;
     private com.sun.net.httpserver.HttpServer foliaHttpServer = null;
     private int foliaHttpPort = -1;
+    // Folia 接管声音期间：记录打开前的状态，关闭时恢复
+    private boolean foliaOwningAudio = false;      // 本次 Folia 是否已接管声音（决定关闭时是否恢复）
+    private boolean foliaResumedMain = false;     // 关闭 Folia 时是否需要恢复主播放器播放
+    private boolean foliaPrevRendererFX = false;  // 打开前 3D 歌词悬浮窗是否开启
+    private double foliaPrevProgressMs = 0;       // 打开 Folia 时的主播放器进度（Folia 加载期间的起点）
+    private long foliaOpenWallTime = 0;            // 打开 Folia 的墙钟时间，用于关闭时推算进度
+    // 浏览器存活监控：最后一次请求 HttpServer 的墙钟时间戳
+    private volatile long foliaLastReqWallTime = 0;
+    private Thread foliaWatchdogThread = null;
+    private volatile boolean foliaWatchdogRunning = false;
+    private long lastFoliaAudioLog = 0;  // __audio 日志限流
+    private long lastFoliaStateLog = 0; // /api/state 日志限流
+    // Folia 关闭时上报的最终状态（sendBeacon），用于把进度/播放态同步回主播放器
+    private volatile double foliaCloseSec = -1;      // <0 表示没有收到关闭上报
+    private volatile boolean foliaClosePlaying = false;
+    private volatile long foliaCloseReportedAt = 0;  // 收到关闭上报的墙钟时间；收到新请求会清零（说明只是刷新页面）
 
     // ===== 歌词设置 =====
     /** 歌词来源顺序，元素取自 qq / netease / kugou，按顺序尝试 */
@@ -307,7 +327,7 @@ public class PlayerApp extends Application {
     /** 是否加粗歌词：开启后普通行也用粗体（当前行始终加粗） */
     private boolean lyricBold = true;
     // ===== 歌词字体候选（分中英文）=====
-    // 系统字体有几百个，全塞进下拉框根本没法挑，这里只列常用的一小撮（按“系统里存在”过滤，
+    // 系统字体有几百个，全塞进下拉框根本没法挑，这里只列常用的一小撮（按"系统里存在"过滤，
     // 实际可选 5~10 个）；需要别的字体仍可把 ttf/otf 直接拖进下拉框。
     private static final List<String> LYRIC_FONT_CN_CANDIDATES = List.of(
             "Microsoft YaHei", "Microsoft YaHei UI", "DengXian", "SimHei", "SimSun",
@@ -336,9 +356,9 @@ public class PlayerApp extends Application {
     // ★ 无限滚动用
     private int loadedVideoCount = 0;
     private static final int VIDEO_PAGE_SIZE = 30;
-    // 歌词设置中每个候选歌曲预览显示的歌词行数（点击“使用”才应用完整歌词）
+    // 歌词设置中每个候选歌曲预览显示的歌词行数（点击"使用"才应用完整歌词）
     private static final int CANDIDATE_PREVIEW_LINES = 3;
-    // “可选来源”列表区的最大高度：超过则内部滚动，避免候选过多把整个面板撑得过长
+    // "可选来源"列表区的最大高度：超过则内部滚动，避免候选过多把整个面板撑得过长
     private static final double SOURCE_LIST_MAX_H = 230;
     // 「可选来源」列表区的最小高度：主窗口太矮时的兜底（列表内部仍可滚动，不会丢内容）
     private static final double SOURCE_LIST_MIN_H = 90;
@@ -348,7 +368,7 @@ public class PlayerApp extends Application {
      * 列表底部就会顶出弹出层边框一点（行数越多越明显）。
      */
     private static final double COMBO_ROW_H = 29;
-    // 歌词设置“可选来源”中每个来源搜索到的候选歌曲数量（同来源多首匹配，每首一个可选版本）
+    // 歌词设置"可选来源"中每个来源搜索到的候选歌曲数量（同来源多首匹配，每首一个可选版本）
     private static final int SOURCE_CANDIDATE_COUNT = 5;
 
     // ★ 窗口保持原尺寸不变
@@ -367,7 +387,7 @@ public class PlayerApp extends Application {
     private int bgBlueOpacity = 100;        // 浅蓝背景不透明度 0~100（越低蓝越淡、越透出白色底；与顶栏互不干扰）
     private int bgBlueBlur = 14;            // 浅蓝背景高斯模糊强度 0~30（0=清晰无模糊；与顶栏磨砂颗粒互不干扰）
     private int whiteBgOpacity = 100;       // 白色底不透明度 0~100（越低越透，桌面从白色底透出；与浅蓝层叠加）
-    private Rectangle rootClip;             // 窗口圆角裁剪：随“圆角半径”实时更新
+    private Rectangle rootClip;             // 窗口圆角裁剪：随"圆角半径"实时更新
     private BorderPane titleBar;            // 顶栏：随顶栏不透明度/磨砂强度实时更新（磨砂颗粒，保持原样）
     private boolean cardBlurEnabled = true; // 播放页左/右卡片毛玻璃：局部 DWM 模糊窗口背后桌面（仅 Windows）
     private VBox leftPlayer;                // 播放页左侧卡片节点（毛玻璃区域之一）
@@ -510,7 +530,8 @@ public class PlayerApp extends Application {
     }
 
     public static class FavVideo {
-        public final String bvid, upName;
+        public final String bvid;
+        public String upName;   // 可变：缺作者时由元数据补齐
         public String title;
         public final int duration;
 
@@ -576,7 +597,7 @@ public class PlayerApp extends Application {
         else
             System.out.println("[fonts] Computer Modern Italic 已加载，族名=" + EMBEDDED_CM_FAMILY);
         // 注意：拖入字体的重新加载已移到 Scene 创建之后（见下方 stage.setScene 之后），
-        // 以确保 JavaFX 字体子系统完全就绪，避免“重启后字体未注册、3D 歌词回退到默认字体”。
+        // 以确保 JavaFX 字体子系统完全就绪，避免"重启后字体未注册、3D 歌词回退到默认字体"。
         biliCookie = loadCookie();
         if (biliCookie != null) {
             BiliAudioFetcher.setCookie(biliCookie);
@@ -587,6 +608,7 @@ public class PlayerApp extends Application {
 
         // 初始化音频播放器
         audioPlayer = new BiliAudioPlayer();
+        // 不再向 Folia 同步播放/暂停/进度：主播放器除曲目外与 Folia 互不影响
         audioPlayer.setCallback(new BiliAudioPlayer.PlayCallback() {
             @Override
             public void onPlaying() {
@@ -651,7 +673,7 @@ public class PlayerApp extends Application {
                     lastKnownTotal = total;
                     lastProgressMs = cur;
                     // 拖动进度条期间，歌词与进度条由拖动监听实时驱动，这里不回写，
-                    // 否则 onProgress 携带的“实际播放位置”会把歌词覆盖回拖动前的位置。
+                    // 否则 onProgress 携带的"实际播放位置"会把歌词覆盖回拖动前的位置。
                     if (!seeking) {
                         if (useLyricRendererFX && LyricRendererFX.isShowing()) {
                             LyricRendererFX.setProgress(cur / 1000.0);
@@ -680,7 +702,7 @@ public class PlayerApp extends Application {
         // 圆角仍由 rootClip 裁出，投影由外层 windowRoot 的 DropShadow 提供。
         refreshRootGlass();
 
-        // 裁剪矩形提为字段：外观设置的“圆角半径”需要实时改它的圆角
+        // 裁剪矩形提为字段：外观设置的"圆角半径"需要实时改它的圆角
         rootClip = new Rectangle(INIT_W, INIT_H);
         rootClip.setArcWidth(windowCornerRadius * 2);
         rootClip.setArcHeight(windowCornerRadius * 2);
@@ -754,7 +776,7 @@ public class PlayerApp extends Application {
         // ===== 重新加载之前拖入的自定义字体（必须在 Scene 创建之后，确保字体子系统就绪）=====
         // 用实际加载到的真实 family 名回写 lyricFontCN/EN：万一重启后 JVM 字体环境变了、
         // 注册到的 family 名与存储名不一致，这里自动纠正，否则 LyricRendererFX 的 Font.font(fam)
-        // 会静默回退到默认字体 → 看起来“没记住字体”。
+        // 会静默回退到默认字体 → 看起来"没记住字体"。
         String realCnFam = reloadCustomFont("CN", lyricFontCNPath, lyricFontCN);
         if (realCnFam != null && !realCnFam.equals(lyricFontCN)) { lyricFontCN = realCnFam; saveSettings(); }
         String realEnFam = reloadCustomFont("EN", lyricFontENPath, lyricFontEN);
@@ -764,7 +786,7 @@ public class PlayerApp extends Application {
 
         // 关闭主窗口：若系统托盘可用则最小化到托盘（不退出），否则直接落盘退出。
         // 再用 JVM 停机钩子兜底（Alt+F4 / 系统关机等路径）。
-        // 关键：关闭窗口只是“隐藏”，不要让 JavaFX 在“最后一个可见窗口消失”时自动退出，
+        // 关键：关闭窗口只是"隐藏"，不要让 JavaFX 在"最后一个可见窗口消失"时自动退出，
         // 否则隐藏到托盘后运行时被关掉、托盘图标变死；退出改由托盘菜单 trayExit() 显式控制。
         Platform.setImplicitExit(false);
         setupSystemTray();
@@ -935,6 +957,9 @@ public class PlayerApp extends Application {
             URL url = new URL("https://api.bilibili.com/x/web-interface/view?bvid=" + bvid);
             HttpURLConnection conn = (HttpURLConnection) url.openConnection();
             conn.setRequestMethod("GET");
+            // 必须设超时：否则网络抖动时会把「加载中...」永远挂住
+            conn.setConnectTimeout(8_000);
+            conn.setReadTimeout(20_000);
             conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
             conn.setRequestProperty("Referer", "https://www.bilibili.com/");
             if (biliCookie != null && !biliCookie.isEmpty()) conn.setRequestProperty("Cookie", biliCookie);
@@ -1081,7 +1106,7 @@ public class PlayerApp extends Application {
         styleWindowButton(minBtn, 20);
         styleWindowButton(closeBtn, 24);
         minBtn.setOnAction(e -> stage.setIconified(true));
-        // 托盘可用时，应用内关闭按钮也走“最小化到托盘”（保持 JavaFX 工具包存活，否则托盘会变死），
+        // 托盘可用时，应用内关闭按钮也走"最小化到托盘"（保持 JavaFX 工具包存活，否则托盘会变死），
         // 托盘不可用（或已选择退出）才真正关闭退出
         closeBtn.setOnAction(e -> {
             if (trayAvailable && !trayExit) {
@@ -1766,11 +1791,13 @@ public class PlayerApp extends Application {
             return;
         }
         leftCoverBvid = bvid;
+        foliaCoverUrl = null;   // 切歌先清旧封面，等新封面 URL 取回再填
         setCoverImage(null);
 
         new Thread(() -> {
             String picUrl = fetchVideoCoverPic(bvid);
             if (picUrl == null) return;
+            foliaCoverUrl = picUrl;   // 缓存给 Folia 注入（不影响原有封面显示）
             final String fbvid = bvid;
             Image img = new Image(picUrl, 0, 0, false, true, true);
             Platform.runLater(() -> {
@@ -1816,7 +1843,7 @@ public class PlayerApp extends Application {
         // 切到下一首时，新歌词由 LyricView 从最底部向上缓动滚入（换歌转场在 LyricView 内处理），
         // 不再硬跳到顶部。
         lyricView.loadLyric(query, lyricSourceOrder);
-        // 偏移已烘焙进该首歌的本地歌词文件；这里把“当前偏移”回显为文件里记录的累计偏移，
+        // 偏移已烘焙进该首歌的本地歌词文件；这里把"当前偏移"回显为文件里记录的累计偏移，
         // 不再盲目清零，否则切歌/重启后面板上会显示 +0.00s 而歌词其实已偏移。
         lyricSessionOffset = lyricView.getAppliedOffset();
         updateOffsetLabel();
@@ -1873,7 +1900,7 @@ public class PlayerApp extends Application {
         }
         return sb.toString();
     }
-    /** 判断歌名是否为“纯英文”（含拉丁字母与常见标点，不含中日韩字符） */
+    /** 判断歌名是否为"纯英文"（含拉丁字母与常见标点，不含中日韩字符） */
     private static boolean isEnglishTitle(String s) {
         if (s == null || s.isBlank()) return false;
         int latin = 0, cjk = 0;
@@ -1999,7 +2026,7 @@ public class PlayerApp extends Application {
 
     // ===================== 歌词设置面板 =====================
 
-    /** 构建歌词设置面板（齿轮按钮点击后浮动在窗口右侧展开；“可选来源”可收起、列表内部可滚动） */
+    /** 构建歌词设置面板（齿轮按钮点击后浮动在窗口右侧展开；"可选来源"可收起、列表内部可滚动） */
     private VBox buildLyricSettingsPanel() {
         // 浮动在歌词区右侧的卡片：固定宽度，整体高度按内容自适应
         // 使用与主窗口一致的倒角 RADIUS + 透明背景窗口，呈现圆角
@@ -2097,7 +2124,7 @@ public class PlayerApp extends Application {
         importCard.getChildren().add(importBtn);
 
         VBox content = new VBox(12, offsetCard, sourceCard, importCard);
-        // 只有“可选来源”内部用 ScrollPane 滚动，其余内容直接全显示
+        // 只有"可选来源"内部用 ScrollPane 滚动，其余内容直接全显示
         panel.getChildren().addAll(header, content);
         return panel;
     }
@@ -2179,7 +2206,7 @@ public class PlayerApp extends Application {
             lyricSettingsStage.setWidth(340);
             lyricSettingsStage.sizeToScene();   // 以完整内容尺寸显示，不裁剪、不滚动
             // 不设置 alwaysOnTop：作为主窗口的所属子窗口(initOwner)，默认显示在主窗口之上，
-            // 但不会强制压住其它应用程序窗口，避免“叠加在所有窗口顶层”的问题。
+            // 但不会强制压住其它应用程序窗口，避免"叠加在所有窗口顶层"的问题。
             // 主窗口移动/缩放时，设置窗口同步贴在其右侧（位置锁定，不独立移动）
             primaryStage.xProperty().addListener((o, ov, nv) -> { followPrimary(); updateLyricTitleContrast(); });
             primaryStage.yProperty().addListener((o, ov, nv) -> { followPrimary(); updateLyricTitleContrast(); });
@@ -2203,7 +2230,7 @@ public class PlayerApp extends Application {
     }
 
     /**
-     * 根据标题背后真实屏幕像素的亮度，自动把“歌词设置”设为深色或白色，保证在任意背景下可读。
+     * 根据标题背后真实屏幕像素的亮度，自动把"歌词设置"设为深色或白色，保证在任意背景下可读。
      * 采样舞台顶部中央的纯背景区域（标题上方），避开文字本身。
      */
     private void updateLyricTitleContrast() {
@@ -2262,7 +2289,7 @@ public class PlayerApp extends Application {
         lyricSettingsStage.hide();
     }
 
-    // 拖动主窗口时的惯性跟随：用弹簧式动画平滑追到目标位置（类似“MC 的手”的延迟感）
+    // 拖动主窗口时的惯性跟随：用弹簧式动画平滑追到目标位置（类似"MC 的手"的延迟感）
     private final DoubleProperty followTargetX = new SimpleDoubleProperty();
     private final DoubleProperty followTargetY = new SimpleDoubleProperty();
     private DoubleProperty followX;
@@ -2349,7 +2376,7 @@ public class PlayerApp extends Application {
             try {
                 map = BiliUidLyricService.fetchAllCandidates(q, SOURCE_CANDIDATE_COUNT);
             } catch (Exception ex) {
-                // 拉取失败也要兜底，绝不能让列表永远停在“加载中”
+                // 拉取失败也要兜底，绝不能让列表永远停在"加载中"
                 map = null;
             }
             final Map<String, List<BiliUidLyricService.LyricCandidate>> result = map;
@@ -2394,7 +2421,7 @@ public class PlayerApp extends Application {
                 tip.getStyleClass().add("lyric-loading");
                 lyricSourceList.getChildren().add(tip);
             }
-            // 再补上各平台“点击在线获取”入口，方便联网时直接切换
+            // 再补上各平台"点击在线获取"入口，方便联网时直接切换
             for (String src : lyricSourceOrder) {
                 if (!BiliUidLyricService.SOURCE_LABEL.containsKey(src)) continue;
                 lyricSourceList.getChildren().add(
@@ -2414,8 +2441,8 @@ public class PlayerApp extends Application {
 
     /**
      * 构建单个来源行（可折叠，内部按候选歌曲分组）。
-     * @param cands        该来源的候选列表；每个候选是“搜索该歌名匹配到的某一首歌”的歌词
-     * @param fetchOnDemand true 表示在线未拉到，按钮变为“获取”，点击时实时联网拉取该来源的候选
+     * @param cands        该来源的候选列表；每个候选是"搜索该歌名匹配到的某一首歌"的歌词
+     * @param fetchOnDemand true 表示在线未拉到，按钮变为"获取"，点击时实时联网拉取该来源的候选
      */
     private VBox buildSourceRow(String src, String label, List<BiliUidLyricService.LyricCandidate> cands,
                                 boolean fetchOnDemand) {
@@ -2439,7 +2466,7 @@ public class PlayerApp extends Application {
         useBtn.setCursor(Cursor.HAND);
         head.getChildren().addAll(arrow, name, cnt, sp, useBtn);
 
-        // 内容区：每个候选一组（歌名 - 歌手 + 预览 + 各自“使用”）
+        // 内容区：每个候选一组（歌名 - 歌手 + 预览 + 各自"使用"）
         VBox content = new VBox(6);
         content.getStyleClass().add("lyric-card");
         content.setPadding(new Insets(8, 10, 8, 14));
@@ -2483,7 +2510,7 @@ public class PlayerApp extends Application {
         return row;
     }
 
-    /** 构建单个候选行：歌名 - 歌手 + 前几行预览 + “使用”按钮 */
+    /** 构建单个候选行：歌名 - 歌手 + 前几行预览 + "使用"按钮 */
     private VBox buildCandidateRow(BiliUidLyricService.LyricCandidate c) {
         VBox box = new VBox(2);
 
@@ -2509,7 +2536,7 @@ public class PlayerApp extends Application {
             ln.setTextOverrun(OverrunStyle.ELLIPSIS);
             box.getChildren().add(ln);
         }
-        Label more = new Label("…（共 " + c.lines.size() + " 行，点击“使用”应用）");
+        Label more = new Label("…（共 " + c.lines.size() + " 行，点击「使用」应用）");
         more.getStyleClass().add("lyric-line-preview");
         more.setStyle(more.getStyle() + "-fx-font-style:italic;");
         box.getChildren().add(more);
@@ -2569,7 +2596,7 @@ public class PlayerApp extends Application {
         tl.play();
     }
 
-    /** 点击“获取”：实时联网拉取该来源的前 N 首候选并重绘列表（不自动应用，由用户选一个“使用”） */
+    /** 点击"获取"：实时联网拉取该来源的前 N 首候选并重绘列表（不自动应用，由用户选一个"使用"） */
     private void fetchSourceCandidatesAndShow(String src) {
         final String q = currentLyricQuery;
         if (q == null || q.isBlank() || lyricView == null) return;
@@ -2675,8 +2702,8 @@ public class PlayerApp extends Application {
         }
 
         StackPane lyricBox = new StackPane();
-        // 铺满歌词层，使齿轮的角落对齐是相对“整个右侧面板”而非内容小框，
-        // 这样“到右边/下边等距”才有意义
+        // 铺满歌词层，使齿轮的角落对齐是相对"整个右侧面板"而非内容小框，
+        // 这样"到右边/下边等距"才有意义
         lyricBox.setMaxSize(Double.MAX_VALUE, Double.MAX_VALUE);
         if (lyricView != null) {
             // StackPane 不会把子节点拉伸填满，而是按子节点的 pref 尺寸居中。
@@ -2725,7 +2752,7 @@ public class PlayerApp extends Application {
         lyricBox.getChildren().add(foliaBtn);
 
         // 歌词设置面板改为惰性单例：首次打开面板时再构建（见 openLyricSettings），
-        // 避免每次切回播放页重建页面时产生“旧面板实例”导致来源列表刷新不到、偏移调不动。
+        // 避免每次切回播放页重建页面时产生"旧面板实例"导致来源列表刷新不到、偏移调不动。
 
         VBox.setVgrow(lyricBox, Priority.ALWAYS);
         lyricLayer.getChildren().add(lyricBox);
@@ -3272,7 +3299,7 @@ public class PlayerApp extends Application {
         cell.setOnMouseClicked(e -> switchFavTab(index));
 
         // 不做入场滑入/逐个淡入：歌单页每次进入都会重建侧栏，
-        // 动画重播会让整条选项栏（含背景块）又“动”一次，这里保持静态呈现。
+        // 动画重播会让整条选项栏（含背景块）又"动"一次，这里保持静态呈现。
         return cell;
     }
 
@@ -4019,8 +4046,11 @@ public class PlayerApp extends Application {
                 if (folder.season) fetchSeasonContents(biliCookie, fid, sink);
                 else fetchFavResources(biliCookie, fid, sink);
             } finally {
-                favLoading.remove(cacheKey);
+                // 顺序关键：必须先写缓存再移除 loading 标记。
+                // 反过来的话，等待线程（轮询 favLoading）看到标记消失时缓存还没写/写失败，
+                // 读到 null 就直接 return，收藏夹永远不渲染。
                 favCache.put(cacheKey, result);
+                favLoading.remove(cacheKey);
                 // runLater 是 FIFO：上面各页的回调都已入队在前，这里收尾一定在它们之后执行
                 Platform.runLater(() -> {
                     if (token != favRenderToken) return;
@@ -5120,7 +5150,7 @@ public class PlayerApp extends Application {
         cell.setOnMouseClicked(e -> switchSettingsTab(index));
 
         // 不做入场滑入/逐个淡入：设置页每次进入都会重建侧栏，
-        // 动画重播会让整条选项栏（含背景块）又“动”一次，这里保持静态呈现。
+        // 动画重播会让整条选项栏（含背景块）又"动"一次，这里保持静态呈现。
         return cell;
     }
 
@@ -5538,7 +5568,7 @@ public class PlayerApp extends Application {
             applyD3();
             saveSettings();
             if (rotateZBoxRef[0] != null) rotateZBoxRef[0].setDisable(v);
-            // 禁用时滑块上的数值已不代表实际角度，改显“自动”，避免误导
+            // 禁用时滑块上的数值已不代表实际角度，改显"自动"，避免误导
             if (rotateZLabelRef[0] != null) rotateZLabelRef[0].setText(v ? "自动" : fmtDouble(d3RotateZ));
             System.out.println("[settings] 3D 倾角自适应 → " + v);
         });
@@ -5636,7 +5666,7 @@ public class PlayerApp extends Application {
      * 由歌词加载完成回调与设置开关触发；进度由 onProgress 单独驱动。
      */
     private void syncLyricRenderer() {
-        // 统一在 JavaFX 应用线程执行，保证“关闭→置空→再打开”的先后顺序，
+        // 统一在 JavaFX 应用线程执行，保证"关闭→置空→再打开"的先后顺序，
         // 避免异步关闭导致 isShowing() 误判、重开时跳过 showPreview 而不显示。
         javafx.application.Platform.runLater(() -> {
             if (!useLyricRendererFX) {
@@ -5721,133 +5751,175 @@ public class PlayerApp extends Application {
 
     // ===== Folia 全屏歌词视觉 =====
 
-    /** 打开 Folia 全屏视觉窗口（serving Folia 原项目 dist） */
+    /**
+     * 关闭 Folia 时：用 Folia 关闭前上报的进度（sendBeacon）同步回主播放器；
+     * 没收到上报时按墙钟兜底推算。恢复主播放器播放与 3D 歌词。
+     */
+    private void restoreFromFolia() {
+        if (!foliaOwningAudio) return;
+
+        foliaOwningAudio = false;
+        if (audioPlayer != null) audioPlayer.hostMode = false;
+
+        double foliaSec;
+        boolean shouldResume;
+        if (foliaCloseSec >= 0) {
+            // 优先用关闭上报的精确进度/播放态
+            foliaSec = foliaCloseSec;
+            shouldResume = foliaClosePlaying;
+            System.out.println("[Folia] 关闭接管，上报进度=" + foliaSec + "s");
+        } else {
+            // 兜底：墙钟推算（openFoliaFullscreen 时记录了起点）
+            foliaSec = foliaOpenWallTime > 0
+                ? (System.currentTimeMillis() - foliaOpenWallTime) / 1000.0
+                : foliaPrevProgressMs / 1000.0;
+            shouldResume = foliaResumedMain;
+            System.out.println("[Folia] 关闭接管，墙钟进度=" + foliaSec + "s");
+        }
+        foliaCloseSec = -1;
+        foliaCloseReportedAt = 0;
+
+        final double seekMs = foliaSec * 1000.0;
+        final boolean doResume = shouldResume;
+        Platform.runLater(() -> {
+            try {
+                if (audioPlayer != null && seekMs > 0) audioPlayer.seekTo(seekMs);
+                if (lyricView != null) lyricView.updateMillis(seekMs);
+                if (doResume && audioPlayer != null && !audioPlayer.isPlaying()) {
+                    audioPlayer.resume();
+                    if (lyricView != null) lyricView.start();
+                    setPlayIcon(true);
+                }
+                if (foliaPrevRendererFX && !useLyricRendererFX) {
+                    useLyricRendererFX = true;
+                    syncLyricRenderer();
+                }
+            } catch (Exception e) {
+                System.out.println("[Folia] 恢复主播放器失败: " + e.getMessage());
+            }
+        });
+    }
+
+    /** 打开原生 Folia：起 HttpServer serving dist + /api/state 喂数据 + Desktop.browse 打开浏览器 */
     private void openFoliaFullscreen() {
         javafx.application.Platform.runLater(() -> {
-            if (foliaStage != null && foliaStage.isShowing()) {
-                foliaStage.requestFocus();
-                foliaStage.toFront();
-                return;
-            }
             try {
-                // 1) 把 resources/folia-dist/ 拷到临时目录（HttpServer 需要文件系统路径）
-                File distDir = copyResourceDirToTemp("/folia-dist");
+                // 1) 优先用开发路径：folia-extracted/folia-major-main/dist/（source build，无需 copy）
+                //    找不到再 fallback 到 resources/folia-dist
+                File distDir = new File("folia-extracted", "folia-major-main/dist");
+                if (!distDir.exists()) {
+                    // fallback：resources 目录
+                    distDir = copyResourceDirToTemp("/folia-dist");
+                }
                 if (distDir == null || !distDir.exists()) {
-                    System.err.println("[Folia] folia-dist 不存在！");
+                    System.err.println("[Folia] folia-dist 不存在！（已尝试 folia-extracted/.../dist 和 resources）");
                     return;
                 }
-                System.out.println("[Folia] dist 临时目录: " + distDir.getAbsolutePath());
+                System.out.println("[Folia] 用 dist 目录: " + distDir.getAbsolutePath());
 
-                // 1.5) 注入 Folia 钩子到 index.html（hook fetch + 探测 Zustand store + 全局桥）
-                injectFoliaHooks(distDir);
-
-                // 2) 起 mini HttpServer serving dist
+                // 2) 起 HttpServer（serve SPA + /__audio + /api/state）
                 startFoliaHttpServer(distDir);
-                String foliaUrl = "http://localhost:" + foliaHttpPort + "/index.html";
-                System.out.println("[Folia] URL: " + foliaUrl);
+                String foliaUrl = "http://localhost:" + foliaHttpPort + "/index.html?host=1";
+                System.out.println("[Folia] 原生启动: " + foliaUrl);
 
-                // 3) 创建 Stage + WebView
-                foliaStage = new Stage();
-                foliaStage.setTitle("Folia Fullscreen");
-                foliaStage.initStyle(javafx.stage.StageStyle.UNDECORATED);
-                foliaStage.setFullScreen(true);
-                foliaStage.setFullScreenExitHint("按 Esc / 双击 / 点击右上角 ✕ 退出全屏");
-                foliaStage.setOnCloseRequest(e -> {
-                    foliaStage.close();
-                    stopFoliaHttpServer();
-                    foliaStage = null; foliaWebView = null; foliaEngine = null;
-                });
+                // 3) 接管声音：暂停主播放器、关 3D 悬浮窗、记录墙钟起点。
+                //    关闭 Folia 时按墙钟推算进度、恢复主播放器 + 3D。
+                foliaPrevProgressMs = lastProgressMs;
+                foliaOpenWallTime = System.currentTimeMillis();
+                foliaPrevRendererFX = useLyricRendererFX;
+                foliaResumedMain = (audioPlayer != null && audioPlayer.isPlaying());
+                foliaOwningAudio = true;
+                // 重置关闭上报状态（本次会话尚未关闭）
+                foliaCloseSec = -1;
+                foliaCloseReportedAt = 0;
+                // 打开 Folia 即无条件暂停主播放器，并进入 hostMode（后续切歌只准备文件，不出声）
+                if (audioPlayer != null) { audioPlayer.hostMode = true; audioPlayer.pause(); }
+                if (lyricView != null) lyricView.pause();
+                if (useLyricRendererFX) { useLyricRendererFX = false; syncLyricRenderer(); }
+                System.out.println("[Folia] 主播放器已暂停，3D 歌词已关闭，prevProgress=" + foliaPrevProgressMs + "ms");
 
-                foliaWebView = new WebView();
-                foliaWebView.setStyle("-fx-background-color:#08081a;");
-                foliaEngine = foliaWebView.getEngine();
-                foliaEngine.setJavaScriptEnabled(true);
-                // 捕获 Folia 的 JS 事件
-                foliaEngine.setOnAlert(msg -> System.out.println("[Folia-ALERT] " + msg.getData()));
-                foliaEngine.setOnError(err -> System.err.println("[Folia-ERR] " + err.getMessage()));
-                foliaEngine.setOnStatusChanged(evt -> System.out.println("[Folia-STATUS] " + evt.getData()));
-
-                foliaEngine.getLoadWorker().stateProperty().addListener((o, ov, nv) -> {
-                    if (nv == javafx.concurrent.Worker.State.SUCCEEDED) {
-                        try {
-                            foliaEngine.executeScript(
-                                "localStorage.setItem('visualizer_mode','classic');"
-                                + "localStorage.setItem('visualizer_background_mode','latent');"
-                                + "localStorage.setItem('appChrome','minimal');"
-                                + "console.log('[Folia] localStorage injected');"
-                            );
-                            System.out.println("[Folia] Folia SPA loaded, localStorage set");
-
-                            foliaEngine.executeScript(
-                                "(function(){"
-                                + "var _scanOnce=function(){"
-                                + "  var stores=[];"
-                                + "  for(var k in window){"
-                                + "    if(k.indexOf('__folia_exports_')!==0)continue;"
-                                + "    try{var v=window[k];if(v&&typeof v.getState==='function'&&typeof v.setState==='function'){stores.push(v);}}"
-                                + "    catch(x){}"
-                                + "  }"
-                                + "  return stores;"
-                                + "};"
-                                + "var _doScan=function(){"
-                                + "  var ss=_scanOnce();"
-                                + "  for(var i=0;i<ss.length;i++){"
-                                + "    var st=ss[i].getState();"
-                                + "    if(!window.__foliaViewStore&&'view' in st&&'setView' in st){window.__foliaViewStore=ss[i];}"
-                                + "    if(!window.__foliaVizStore&&'visualizerMode' in st){window.__foliaVizStore=ss[i];}"
-                                + "    if(!window.__foliaPb&&'playerState' in st&&'lyrics' in st){window.__foliaPb=ss[i];}"
-                                + "  }"
-                                + "  if(window.__foliaViewStore){"
-                                + "    try{var vs=window.__foliaViewStore.getState();if(vs.view!=='player'){vs.setView('player');}}catch(x){}"
-                                + "  }"
-                                + "};"
-                                + "setTimeout(_doScan,500);"
-                                + "setTimeout(_doScan,1500);"
-                                + "setTimeout(_doScan,3000);"
-                                + "})();"
-                            );
-                            System.out.println("[Folia] store scanner injected");
-
-                            // 强制关闭 release notes / ponder 等启动弹窗（只 patch Zustand stores，不做 DOM remove）
-                            foliaEngine.executeScript(
-                                "(function(){"
-                                + "var _forceCloseStartup=function(){"
-                                + "  try{"
-                                + "    for(var k in window){"
-                                + "      if(k.indexOf('__folia_exports_')!==0)continue;"
-                                + "      try{var v=window[k];if(v&&typeof v.setState==='function'){"
-                                + "        var st=v.getState();"
-                                + "        if('isReleaseNotesOpen' in st)v.setState({isReleaseNotesOpen:false});"
-                                + "        if('isUserGuideModalOpen' in st)v.setState({isUserGuideModalOpen:false});"
-                                + "        if('isPlaybackEntryViewPromptOpen' in st)v.setState({isPlaybackEntryViewPromptOpen:false});"
-                                + "        if('playbackEntryViewPromptOpen' in st)v.setState({playbackEntryViewPromptOpen:false});"
-                                + "      }}"
-                                + "      catch(x){}"
-                                + "    }"
-                                + "  }catch(x){}"
-                                + "};"
-                                + "setTimeout(_forceCloseStartup,200);"
-                                + "setTimeout(_forceCloseStartup,1000);"
-                                + "})();"
-                            );
-
-                            new Thread(() -> {
-                                try { Thread.sleep(4000); } catch (InterruptedException e) { return; }
-                                javafx.application.Platform.runLater(() -> injectFoliaPlaybackData());
-                            }, "FoliaDataInjector").start();
-                        } catch (Exception ex) {
-                            System.err.println("[Folia] SUCCEEDED 后 executeScript 异常: " + ex.getMessage());
+                // 后台补齐歌单元数据：缺标题/作者的条目用 B 站接口补全，
+                // Folia 队列里才不会只显示 bvid 和 ui.unknownArtist
+                new Thread(() -> {
+                    try {
+                        List<FavVideo> list = getCurrentPlaylist();
+                        if (list == null) return;
+                        int fixed = 0;
+                        for (FavVideo v : list) {
+                            if (!foliaOwningAudio) break;
+                            boolean needTitle = v.title == null || v.title.isEmpty() || v.title.equals(v.bvid);
+                            boolean needUp = v.upName == null || v.upName.isEmpty();
+                            if (!needTitle && !needUp) continue;
+                            FavVideo m = fetchVideoMeta(v.bvid);
+                            if (m == null) continue;
+                            if (needTitle && m.title != null && !m.title.isEmpty()) v.title = m.title;
+                            if (needUp && m.upName != null) v.upName = m.upName;
+                            fixed++;
                         }
-                    }
-                });
+                        if (fixed > 0) System.out.println("[Folia] 歌单元数据补齐: " + fixed + " 首");
+                    } catch (Exception ignored) {}
+                }, "folia-meta-prefetch").start();
 
-                foliaEngine.load(foliaUrl);
-                foliaStage.setScene(new Scene(foliaWebView, javafx.scene.paint.Color.BLACK));
-                foliaStage.show();
-                foliaStage.requestFocus();
+                // 4) 用检测到的浏览器以独立窗口启动，Desktop.browse 兜底
+                //    首次开启先提示退出全屏的方式，并声明 Folia 原作者（只弹一次）
+                if (!foliaFullscreenTipShown) {
+                    Alert tip = new Alert(Alert.AlertType.INFORMATION);
+                    tip.setTitle("Folia 全屏提示");
+                    tip.setHeaderText("Folia 即将以全屏独立窗口启动");
+                    tip.setContentText(
+                            "退出 / 切换全屏：\n" +
+                            "  · 长按 Esc 键\n" +
+                            "  · 或按 F11\n\n" +
+                            "Folia 原作者：chthollyphile\n" +
+                            "项目地址：github.com/chthollyphile/folia-major（AGPL-3.0）\n" +
+                            "感谢原作者及所有贡献者。");
+                    if (primaryStage != null) tip.initOwner(primaryStage);
+                    tip.getButtonTypes().setAll(new ButtonType("知道了", ButtonBar.ButtonData.OK_DONE));
+                    tip.showAndWait();
+                    foliaFullscreenTipShown = true;
+                    saveSettings();
+                }
+                String browserExe = detectBrowserExecutable();
+                if (browserExe != null) {
+                    String exeLower = browserExe.toLowerCase();
+                    boolean chromium = exeLower.contains("chrome") || exeLower.contains("msedge");
+                    if (chromium) {
+                        // --app 模式：去掉地址栏/标签页，得到像桌面应用一样的独立窗口。
+                        // 使用独立 user-data-dir，避免和用户日常浏览的标签页/会话混在一起。
+                        String profileDir = System.getProperty("user.home") + "/.pcl-player/folia-app-profile";
+                        new File(profileDir).mkdirs();
+                        java.awt.Dimension screen = java.awt.Toolkit.getDefaultToolkit().getScreenSize();
+                        int winW = (int) Math.max(1024, screen.width * 0.92);
+                        int winH = (int) Math.max(700, screen.height * 0.92);
+                        new ProcessBuilder(browserExe,
+                                "--app=" + foliaUrl,
+                                "--start-fullscreen",
+                                "--window-size=" + winW + "," + winH,
+                                "--user-data-dir=" + profileDir,
+                                "--no-first-run",
+                                "--no-default-browser-check",
+                                "--autoplay-policy=no-user-gesture-required").start();
+                        System.out.println("[Folia] 全屏独立窗口启动: " + browserExe);
+                    } else {
+                        new ProcessBuilder(browserExe, foliaUrl).start();
+                        System.out.println("[Folia] 浏览器窗口启动: " + browserExe);
+                    }
+                } else {
+                    java.awt.Desktop d = java.awt.Desktop.getDesktop();
+                    if (d.isSupported(java.awt.Desktop.Action.BROWSE)) {
+                        d.browse(new java.net.URI(foliaUrl));
+                        System.out.println("[Folia] 无专用浏览器，Desktop.browse 兜底");
+                    } else {
+                        new ProcessBuilder("rundll32", "url.dll,FileProtocolHandler", foliaUrl).start();
+                    }
+                }
+
+                // 5) 启动浏览器存活监控（8 秒无请求 → 浏览器关了 → 自动恢复音量/进度）
+                startFoliaWatchdog();
             } catch (Exception ex) {
                 System.err.println("[Folia] 启动失败: " + ex.getMessage());
                 ex.printStackTrace();
+                stopFoliaWatchdog();
                 stopFoliaHttpServer();
             }
         });
@@ -5996,14 +6068,25 @@ public class PlayerApp extends Application {
                 String orig = java.nio.file.Files.readString(bootstrapChunk.toPath(), java.nio.charset.StandardCharsets.UTF_8);
                 if (!orig.contains("FOLIA_BOOTSTRAP_PATCHED")) {
                     String patched = orig;
-                    // patch 1: 暴露 playback store Y
+                    // patch 1: 暴露 playback store Y + 固定句柄 + 拦截 IDLE 写入。
+                    // Folia 内部 effect/audio 事件会频繁把 playerState 写回 IDLE，导致 visualizer paused=true
+                    // 隐藏歌词。每 500ms 外部拉回 PLAYING 抢不过，故在 store 源头包装 setState 强制过滤 IDLE。
                     patched = patched + "\n// FOLIA_BOOTSTRAP_PATCHED\n"
                         + "try{\n"
                         + "  if(typeof Y!=='undefined' && typeof Y.getState==='function'){\n"
                         + "    window.__foliaPb = Y;\n"
-                        + "    console.log('[Folia-PB] bootstrap Y exposed');\n"
+                        + "    window.__foliaPbDirect = Y;\n"
+                        + "    var _origSetState = Y.setState.bind(Y);\n"
+                        + "    Y.setState = function(p,a){\n"
+                        + "      var q=p;\n"
+                        + "      if(window.__foliaForcePlaying && q && typeof q==='object' && q.playerState==='IDLE'){\n"
+                        + "        q=Object.assign({},q,{playerState:'PLAYING',isLoadingToPlay:false});\n"
+                        + "      }\n"
+                        + "      return _origSetState(q,a);\n"
+                        + "    };\n"
+                        + "    console.log('[Folia-PB] bootstrap Y exposed + setState wrapped');\n"
                         + "  }\n"
-                        + "}catch(e){}\n";
+                        + "}catch(e){console.error('[Folia-PB] patch err '+e.message);}\n";
                     java.nio.file.Files.writeString(bootstrapChunk.toPath(), patched, java.nio.charset.StandardCharsets.UTF_8);
                     System.out.println("[Folia] bootstrap chunk patched");
                 }
@@ -6052,6 +6135,126 @@ public class PlayerApp extends Application {
         }
     }
 
+    /**
+     * 供 Folia 注入用：从主播放器 lyricView 读取当前歌词，导出为 JSON 数组。
+     * 时间单位输出为毫秒（- Folia 注入 JS 里会 /1000 转成秒）。
+     * 关键：必须从 lyricView 读，而不是 LyricRendererFX.getLyricsAsJson()——
+     * 后者是 3D 悬浮窗自己的 lines，只有开启 3D 歌词才有数据，未开启时恒为 []（导致"无音轨"）。
+     */
+    private String foliaLyricsJson() {
+        StringBuilder sb = new StringBuilder("[");
+        try {
+            List<LyricView.LyricLine> ls = (lyricView != null) ? lyricView.getLines() : null;
+            if (ls != null) {
+                boolean first = true;
+                for (LyricView.LyricLine l : ls) {
+                    if (l == null) continue;
+                    if (!first) sb.append(",");
+                    first = false;
+                    String text = l.text == null ? "" : l.text
+                            .replace("\\", "\\\\").replace("\"", "\\\"")
+                            .replace("\n", "\\n").replace("\r", "");
+                    // LyricView 的 start/end 是秒，这里输出毫秒（×1000），对齐全项目注入 JS 的 /1000
+                    sb.append("{\"text\":\"").append(text).append("\"")
+                      .append(",\"start\":").append(Math.round(l.start * 1000.0))
+                      .append(",\"end\":").append(Math.round(l.end * 1000.0))
+                      .append("}");
+                }
+            }
+        } catch (Exception e) {
+            System.out.println("[Folia] foliaLyricsJson 异常: " + e.getMessage());
+        }
+        sb.append("]");
+        return sb.toString();
+    }
+
+    /** 在歌单缓存里按 bvid 找条目（Folia 切歌时可直接复用已知标题/作者）。 */
+    private FavVideo findKnownVideo(String bvid) {
+        if (bvid == null) return null;
+        try {
+            // 先查当前播放列表，再兜底扫描所有已加载过的歌单（当前列表可能已切走）
+            FavVideo hit = matchVideo(getCurrentPlaylist(), bvid);
+            if (hit != null) return hit;
+            for (List<FavVideo> l : folderVideoCache.values()) {
+                hit = matchVideo(l, bvid);
+                if (hit != null) return hit;
+            }
+            for (List<FavVideo> l : favCache.values()) {
+                hit = matchVideo(l, bvid);
+                if (hit != null) return hit;
+            }
+            return matchVideo(syncedVideos, bvid);
+        } catch (Exception ignored) {}
+        return null;
+    }
+
+    private static FavVideo matchVideo(List<FavVideo> list, String bvid) {
+        if (list == null) return null;
+        for (FavVideo v : list) {
+            if (v != null && bvid.equals(v.bvid)) return v;
+        }
+        return null;
+    }
+
+    /** 元数据补齐后回写所有歌单缓存，让 /api/state 的 playQueue 也带上真实歌名/作者。 */
+    private void updateKnownVideo(String bvid, String title, String upName) {
+        if (bvid == null) return;
+        try {
+            for (List<FavVideo> l : folderVideoCache.values()) {
+                if (l == null) continue;
+                for (FavVideo v : l) {
+                    if (v != null && bvid.equals(v.bvid)) {
+                        if (title != null && !title.isEmpty()) v.title = title;
+                        if (upName != null && !upName.isEmpty()) v.upName = upName;
+                    }
+                }
+            }
+            if (syncedVideos != null) {
+                for (FavVideo v : syncedVideos) {
+                    if (v != null && bvid.equals(v.bvid)) {
+                        if (title != null && !title.isEmpty()) v.title = title;
+                        if (upName != null && !upName.isEmpty()) v.upName = upName;
+                    }
+                }
+            }
+        } catch (Exception ignored) {}
+    }
+
+    /**
+     * 供 Folia 注入用：把当前播放列表（getCurrentPlaylist）全部歌曲导出成 Folia SongResult JSON 数组。
+     * 这样 Folia 的播放队列里有完整列表，而不是只有当前一首。
+     */
+    private String foliaPlaylistJson() {
+        StringBuilder sb = new StringBuilder("[");
+        try {
+            List<FavVideo> list = getCurrentPlaylist();
+            if (list != null) {
+                boolean first = true;
+                for (FavVideo v : list) {
+                    if (v == null) continue;
+                    if (!first) sb.append(",");
+                    first = false;
+                    String rawTitle = (v.title != null && !v.title.isEmpty()) ? v.title : v.bvid;
+                    String rawArtist = (v.upName != null && !v.upName.isEmpty()) ? v.upName : "未知歌手";
+                    String title = foliaJsStr(rawTitle);
+                    String artist = foliaJsStr(rawArtist);
+                    String id = foliaJsStr(v.bvid);
+                    long durMs = Math.max(0, (long) v.duration * 1000L);
+                    sb.append("{\"id\":\"").append(id).append("\",")
+                      .append("\"name\":\"").append(title).append("\",")
+                      .append("\"artists\":[{\"id\":\"").append(artist).append("\",\"name\":\"").append(artist).append("\"}],")
+                      .append("\"album\":{\"id\":\"\",\"name\":\"\",\"coverUrl\":null},")
+                      .append("\"durationMs\":").append(durMs)
+                      .append("}");
+                }
+            }
+        } catch (Exception e) {
+            System.out.println("[Folia] foliaPlaylistJson 异常: " + e.getMessage());
+        }
+        sb.append("]");
+        return sb.toString();
+    }
+
     /** Folia SPA 渲染完后，把我们的歌词/封面/元数据注入 Zustand store */
     private void injectFoliaPlaybackData() {
         if (foliaEngine == null) return;
@@ -6089,7 +6292,11 @@ public class PlayerApp extends Application {
             Object r0 = foliaEngine.executeScript(js0);
             System.out.println("[Folia-SCAN]\n" + r0);
 
-            String jsonLyrics = LyricRendererFX.getLyricsAsJson();
+            // 从主播放器 lyricView 读歌词（3D 悬浮窗的 LyricRendererFX.lines 未开 3D 时为空）
+            String jsonLyrics = foliaLyricsJson();
+            // 整个播放列表（当前收藏夹全部歌曲），注入 Folia 的 playQueue（Base64 安全编码）
+            String jsonPlaylist = foliaPlaylistJson();
+            String playlistB64 = Base64.getEncoder().encodeToString(jsonPlaylist.getBytes(StandardCharsets.UTF_8));
             // 第一步：dump 完整状态 + DOM
             String js1 = "(function(){"
                 + "const pb = window.__foliaPb; if(!pb) return 'NO_PB';"
@@ -6129,7 +6336,8 @@ public class PlayerApp extends Application {
 
             // 第三步：渐进 patch（step1 基础状态 → step2 元数据 → step3 歌词）
             String js2 = "(function(){"
-                + "var pb = window.__foliaPb; if(!pb) return 'NO_PB';"
+                + "var pb = window.__foliaPbDirect || window.__foliaPb; if(!pb) return 'NO_PB';"
+                + "window.__foliaForcePlaying = true;"
                 + "var _snap=function(tag){"
                 + "  try{"
                 + "    var root=document.getElementById('root');"
@@ -6137,12 +6345,28 @@ public class PlayerApp extends Application {
                 + "  }catch(x){window.status='STEP-'+tag+'-ERR:'+x.message;}"
                 + "};"
                 + "_snap('before');"
-                + "pb.setState({playerState:'playing',audioSrc:'',playQueue:[],activePlaybackContext:'local',isLoadingToPlay:false});"
+                // PlayerState 是字符串枚举 IDLE/PLAYING/PAUSED（全大写），小写 'playing' 会让
+                // displayPlayerState 永远 !== PLAYING → visualizer 一直处于 paused。
+                // 同时必须清空 transitionDisplay：selectDisplayLyrics 优先取它，若残留非 null，
+                // 我们注入的 lyrics 会被 transitionDisplay.lyrics(null) 完全遮蔽 → "无音轨"。
+                // JavaFX WebEngine 无法创建 media player（Could not create player!），给 <audio> 设 src
+                // 只会触发 error→把 currentTime/currentLineIndex 搅乱、时间乱跳、歌词不显示。
+                // 因此不设 audioSrc，让 Folia 专注显示歌词/封面，进度由 Java 侧墙钟驱动。
+                + "pb.setState({playerState:'PLAYING',audioSrc:'http://localhost:" + foliaHttpPort + "/__audio',playQueue:[],activePlaybackContext:'local',"
+                + "isLoadingToPlay:false,transitionDisplay:null,transitionEnd:null,playbackRoute:'web'});"
                 + "_snap('s1-immediate');"
                 + "setTimeout(function(){"
                 + "  _snap('s1-150ms');"
-                + "  var meta=" + PlayerApp.currentSongMetaJsonSafe() + ";"
-                + "  pb.setState({currentSong:meta,duration:meta.duration||0,cachedCoverUrl:meta.coverUrl||null});"
+                + "  var meta=" + currentSongMetaJsonSafe() + ";"
+                + "  if(typeof meta==='string')meta=null;"
+                + "  var queue=[];"
+                + "  try{var qb=atob('" + playlistB64 + "');var qbytes=new Uint8Array(qb.length);"
+                + "for(var qi=0;qi<qb.length;qi++)qbytes[qi]=qb.charCodeAt(qi);"
+                + "queue=JSON.parse(new TextDecoder('utf-8').decode(qbytes));}catch(e){}"
+                + "  if(!(queue instanceof Array)||!queue.length)queue=(meta&&typeof meta==='object')?[meta]:[];"
+                + "  pb.setState({currentSong:meta,duration:(meta&&meta.durationMs||0)/1000,"
+                + "cachedCoverUrl:(meta&&meta.album&&meta.album.coverUrl)||null,"
+                + "playQueue:queue,isFmMode:false});"
                 + "  _snap('s2-immediate');"
                 + "  setTimeout(function(){"
                 + "    _snap('s2-200ms');"
@@ -6159,11 +6383,41 @@ public class PlayerApp extends Application {
                 + "      var st=(l.start||0)/1000;"
                 + "      var et=Math.max((l.end||(l.start+5000))/1000,st+0.5);"
                 + "      var txt=l.text||'';"
-                + "      return {startTime:st,endTime:et,fullText:txt,words:[{text:txt,startTime:st,endTime:et}],renderHints:{}};"
+                // 补完整 renderHints（Folia 原生 createLyricsSetter 会做这一步，外部 setState 绕过了它，
+                // 缺字段会导致逐字布局/高亮异常）。
+                + "      var w=[{text:txt,startTime:st,endTime:et}];"
+                + "      var rh={rawDuration:et-st,timingClass:'normal',renderEndTime:et,lineTransitionMode:'normal',wordRevealMode:'normal'};"
+                + "      return {startTime:st,endTime:et,fullText:txt,words:w,renderHints:rh};"
                 + "    })};"
-                + "    pb.setState({lyrics:foliaLyrics,activeLocalLyricsSource:'local',currentLineIndex:0,handoffLineIndex:0});"
+                // 设权威标记 lyricsSource='imported'：否则 Folia 的自动歌词匹配 / onLyrics 会覆盖我们注入的词。
+                + "    var cur=pb.getState().currentSong;"
+                + "    if(cur){"
+                + "      var ns={lyricsSource:'imported',importedLyrics:foliaLyrics,importedLyricsName:'Folia External',"
+                + "              hasOnlineOverride:false};"
+                + "      pb.setState({lyrics:foliaLyrics,activeLocalLyricsSource:'local',currentLineIndex:0,handoffLineIndex:0,"
+                + "                   currentSong:Object.assign({},cur,{onlineLyricsState:ns})});"
+                + "    }else{"
+                + "      pb.setState({lyrics:foliaLyrics,activeLocalLyricsSource:'local',currentLineIndex:0,handoffLineIndex:0});"
+                + "    }"
                 + "    _snap('s3-immediate');"
-                + "    setTimeout(function(){_snap('s3-500ms');},500);"
+                + "    setTimeout(function(){"
+                + "      _snap('s3-500ms');"
+                + "      // 轮询等 <audio> render 出来后 play()"
+                + "      var tries=0;"
+                + "      var tryPlay=function(){"
+                + "        tries++;"
+                + "        var decks=document.querySelectorAll('audio[data-playback-deck]');"
+                + "        if(decks.length>0){"
+                + "          for(var i=0;i<decks.length;i++){"
+                + "            try{decks[i].currentTime=0;decks[i].play().catch(function(){});}catch(x){}"
+                + "          }"
+                + "          console.log('[Folia] AUDIO-PLAYED decks='+decks.length);"
+                + "          return;"
+                + "        }"
+                + "        if(tries<30) setTimeout(tryPlay,100);"
+                + "      };"
+                + "      setTimeout(tryPlay,300);"
+                + "    },500);"
                 + "  },300);"
                 + "},600);"
                 + "return 'PROGRESSIVE';"
@@ -6172,31 +6426,45 @@ public class PlayerApp extends Application {
             Object r2 = foliaEngine.executeScript(js2);
             System.out.println("[Folia-PB] progressive patch: " + r2);
 
-            // 同步验证：直接读 store state 确认 lyrics 真的进去了
-            try {
-                String verifyJs = "(function(){"
-                    + "var pb=window.__foliaPb; if(!pb) return 'NO_PB';"
-                    + "var s=pb.getState();"
-                    + "var ly=s.lyrics;"
-                    + "var lines=ly&&ly.lines?ly.lines:null;"
-                    + "var firstLine=lines&&lines[0]?lines[0]:null;"
-                    + "return JSON.stringify({"
-                    + "  hasLyrics:!!ly,"
-                    + "  linesLen:lines?lines.length:-1,"
-                    + "  firstLine:firstLine?{startTime:firstLine.startTime,endTime:firstLine.endTime,fullText:firstLine.fullText,hasWords:!!firstLine.words,wordsLen:firstLine.words?firstLine.words.length:0}:null,"
-                    + "  currentLineIndex:s.currentLineIndex,"
-                    + "  playerState:s.playerState,"
-                    + "  hasAudioSrc:!!s.audioSrc,"
-                    + "  playQueueLen:s.playQueue?s.playQueue.length:-1"
-                    + "});"
-                    + "})();";
-                Object verify = foliaEngine.executeScript(verifyJs);
-                System.out.println("[Folia-VERIFY] " + verify);
-            } catch (Exception ex) {
-                System.err.println("[Folia-VERIFY] 异常: " + ex.getMessage());
-            }
+            // 验证：歌词在 step3（600+300ms）才注入，必须延迟到那之后读，否则读到的是空。
+            // 同时按 visualizer 的真实路径检查 displayLyrics（优先取 transitionDisplay.lyrics）。
+            new Thread(() -> {
+                try { Thread.sleep(1500); } catch (InterruptedException e) { return; }
+                javafx.application.Platform.runLater(() -> {
+                    if (foliaEngine == null) return;
+                    try {
+                        String verifyJs = "(function(){"
+                            + "var pb=window.__foliaPbDirect||window.__foliaPb; if(!pb) return 'NO_PB';"
+                            + "var s=pb.getState();"
+                            + "var ly=s.lyrics;"
+                            + "var lines=ly&&ly.lines?ly.lines:null;"
+                            + "var firstLine=lines&&lines[0]?lines[0]:null;"
+                            // visualizer 实际读的是 selectDisplayLyrics：transitionDisplay 非 null 时遮蔽 lyrics
+                            + "var disp=s.transitionDisplay?s.transitionDisplay.lyrics:ly;"
+                            + "var dispLines=disp&&disp.lines?disp.lines:null;"
+                            + "return JSON.stringify({"
+                            + "  hasLyrics:!!ly,"
+                            + "  linesLen:lines?lines.length:-1,"
+                            + "  hasTransition:!!s.transitionDisplay,"
+                            + "  displayLinesLen:dispLines?dispLines.length:-1,"
+                            + "  firstLine:firstLine?{startTime:firstLine.startTime,endTime:firstLine.endTime,fullText:firstLine.fullText,hasWords:!!firstLine.words,wordsLen:firstLine.words?firstLine.words.length:0}:null,"
+                            + "  currentLineIndex:s.currentLineIndex,"
+                            + "  playerState:s.playerState,"
+                            + "  hasAudioSrc:!!s.audioSrc,"
+                            + "  playQueueLen:s.playQueue?s.playQueue.length:-1"
+                            + "});"
+                            + "})();";
+                        Object verify = foliaEngine.executeScript(verifyJs);
+                        System.out.println("[Folia-VERIFY] " + verify);
+                    } catch (Exception ex) {
+                        System.err.println("[Folia-VERIFY] 异常: " + ex.getMessage());
+                    }
+                });
+            }, "FoliaVerify").start();
 
-            // 第三步：每秒同步进度（立即启动）
+            // 进度/状态维持线程：始终启动。
+            // Folia 接管声音后，audio 若无法播放（WebEngine 媒体限制），playerState 会被改回 IDLE
+            // 导致歌词不显示，且进度停滞。此线程持续维持 PLAYING 并按墙钟推算进度，保证歌词正常滚动。
             new Thread(() -> {
                 try { Thread.sleep(800); } catch (InterruptedException e) { return; }
                 javafx.application.Platform.runLater(this::startFoliaProgressSync);
@@ -6207,20 +6475,99 @@ public class PlayerApp extends Application {
         }
     }
 
-    /** 安全地把当前播放歌曲的元数据转成 JSON（供 Folia 注入用） */
-    private static String currentSongMetaJsonSafe() {
+    /** 安全地把当前播放歌曲元数据转成 Folia SongResult 结构（供 Folia 注入用） */
+    private String currentSongMetaJsonSafe() {
+        // Folia SongResult: { id, name, artists:[{id,name}], album:{id,name,coverUrl}, durationMs }
+        // 之前返回空壳（无 name/artists），导致 Folia 显示 "无音轨" + "ui.unknownArtist"。
         try {
+            String title = currentResolvedTitle;
+            if (title == null || title.trim().isEmpty()) title = currentTitleKey;
+            if (title == null || title.trim().isEmpty()) title = currentBvid;
+            if (title == null) title = "";
+            String artist = "";
+            if (currentFavVideo != null && currentFavVideo.upName != null) artist = currentFavVideo.upName;
+            else if (leftArtist != null && leftArtist.getText() != null) {
+                String t = leftArtist.getText();
+                if (!"加载中...".equals(t) && !t.isEmpty()) artist = t;
+            }
+            String id = currentBvid != null ? currentBvid : ("folia-" + Math.abs(title.hashCode()));
+            long durationMs = Math.max(0, (long) lastKnownTotal);
+            // 封面 URL：优先用 loadAndSetCover 缓存的；没缓存到就兜底同步取一次（本方法在 Folia 注入后台线程调用）
+            String coverUrl = foliaCoverUrl;
+            if (coverUrl == null && currentBvid != null && !currentBvid.isEmpty()) {
+                coverUrl = fetchVideoCoverPic(currentBvid);
+                if (coverUrl != null) foliaCoverUrl = coverUrl;
+            }
+            String coverJson = coverUrl != null ? "\"" + foliaJsStr(coverUrl) + "\"" : "null";
+
             StringBuilder sb = new StringBuilder("{");
-            // PlayerApp 非静态字段：用 getInstance() 或者直接在调用点内联
-            sb.append("\"title\":\"\"").append(",");
-            sb.append("\"artist\":\"\"").append(",");
-            sb.append("\"artists\":[]").append(",");
-            sb.append("\"album\":\"\"").append(",");
-            sb.append("\"coverUrl\":null").append(",");
-            sb.append("\"duration\":0");
+            sb.append("\"id\":\"").append(foliaJsStr(id)).append("\",");
+            sb.append("\"name\":\"").append(foliaJsStr(title)).append("\",");
+            sb.append("\"artists\":[{").append("\"id\":\"").append(foliaJsStr(artist)).append("\",")
+              .append("\"name\":\"").append(foliaJsStr(artist)).append("\"}],");
+            sb.append("\"album\":{").append("\"id\":\"\",\"name\":\"\",\"coverUrl\":").append(coverJson).append("},");
+            sb.append("\"durationMs\":").append(durationMs);
             sb.append("}");
             return sb.toString();
         } catch (Exception e) { return "null"; }
+    }
+
+    /** Folia 注入用的极简 JS 字符串转义 */
+    private static String foliaJsStr(String s) {
+        if (s == null) return "";
+        return s.replace("\\", "\\\\").replace("\"", "\\\"")
+                .replace("\n", "\\n").replace("\r", "").replace("\t", " ");
+    }
+
+    /** 从 JSON 字符串里取指定 key 的字符串值（极简实现，只支持简单键值对） */
+    private static String extractJsonStr(String json, String key) {
+        if (json == null || json.isEmpty()) return null;
+        String pat = "\"" + java.util.regex.Pattern.quote(key) + "\"\\s*:\\s*\"";
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile(pat).matcher(json);
+        if (!m.find()) return null;
+        int valStart = m.end();  // 直接用 matcher.end() 跳过 pattern 匹配
+        StringBuilder sb = new StringBuilder();
+        for (int i = valStart; i < json.length(); i++) {
+            char c = json.charAt(i);
+            if (c == '\\' && i + 1 < json.length()) { sb.append(json.charAt(++i)); continue; }
+            if (c == '"') return sb.toString();
+            sb.append(c);
+        }
+        return null;
+    }
+
+    /** 从 JSON 字符串里取指定 key 的 double 值 */
+    private static double extractJsonDouble(String json, String key) {
+        if (json == null) return 0;
+        try {
+            java.util.regex.Matcher m = java.util.regex.Pattern.compile(
+                "\"" + key + "\"\\s*:\\s*(-?\\d+(?:\\.\\d+)?)").matcher(json);
+            if (m.find()) return Double.parseDouble(m.group(1));
+        } catch (Exception ignored) {}
+        return 0;
+    }
+
+    /** 检测本机可用的浏览器可执行文件路径（Windows 常见路径） */
+    private static String detectBrowserExecutable() {
+        String[] candidates = {
+            // Chrome
+            "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+            "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
+            System.getenv("LOCALAPPDATA") + "\\Google\\Chrome\\Application\\chrome.exe",
+            // Edge
+            "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
+            "C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe",
+            System.getenv("PROGRAMFILES(X86)") + "\\Microsoft\\Edge\\Application\\msedge.exe",
+            // Firefox
+            "C:\\Program Files\\Mozilla Firefox\\firefox.exe",
+            "C:\\Program Files (x86)\\Mozilla Firefox\\firefox.exe",
+            // Opera
+            "C:\\Program Files\\Opera\\launcher.exe",
+        };
+        for (String p : candidates) {
+            if (p != null && new File(p).exists()) return p;
+        }
+        return null;
     }
 
     /** 每秒同步播放器进度到 Folia Zustand store */
@@ -6233,12 +6580,25 @@ public class PlayerApp extends Application {
         foliaProgressThread = new Thread(() -> {
             while (foliaProgressRunning && foliaEngine != null && foliaStage != null && foliaStage.isShowing()) {
                 try {
-                    double progressMs = PlayerApp.this.lastProgressMs;
-                    double progressSec = progressMs / 1000.0;
-                    final double pSec = progressSec;
                     javafx.application.Platform.runLater(() -> {
                         if (foliaEngine == null) return;
                         foliaProgressTick++;
+                        // Folia 接管声音：优先读 <audio>.currentTime；WebEngine 若无法解码 mp3，
+                        // 则按打开时刻 + 墙钟推算进度，保证歌词继续滚动、PLAYING 状态不被改回 IDLE。
+                        double fallbackSec = foliaPrevProgressMs / 1000.0
+                                + (System.currentTimeMillis() - foliaOpenWallTime) / 1000.0;
+                        double pSec = (foliaOwningAudio) ? fallbackSec : (PlayerApp.this.lastProgressMs / 1000.0);
+                        if (foliaOwningAudio) {
+                            try {
+                                Object at = foliaEngine.executeScript(
+                                    "(function(){var a=document.querySelector('audio');"
+                                    + "return (a&&isFinite(a.currentTime)&&a.currentTime>0)?a.currentTime:-1;})();");
+                                if (at instanceof Number && ((Number) at).doubleValue() > 0)
+                                    pSec = ((Number) at).doubleValue();
+                            } catch (Exception ignore) {}
+                        }
+                        final double pSecFinal = pSec;
+                        final double progressMs = pSec * 1000.0;
                         try {
                             if (foliaProgressTick <= 3) {
                                 String diag = foliaEngine.executeScript(
@@ -6257,21 +6617,29 @@ public class PlayerApp extends Application {
                             }
                             foliaEngine.executeScript(
                                 "(function(){"
-                                + "const pb = window.__foliaPb;"
+                                + "const pb = window.__foliaPbDirect||window.__foliaPb;"
                                 + "if(pb){"
                                 + "  const s = pb.getState();"
                                 + "  const patch = {};"
-                                + "  if(s.hasOwnProperty('progress')) patch.progress = " + pSec + ";"
-                                + "  if(s.hasOwnProperty('currentTime')) patch.currentTime = " + pSec + ";"
+                                + "  if(s.hasOwnProperty('progress')) patch.progress = " + pSecFinal + ";"
+                                + "  if(s.hasOwnProperty('currentTime')) patch.currentTime = " + pSecFinal + ";"
                                 + "  if(s.hasOwnProperty('elapsed')) patch.elapsed = " + progressMs + ";"
+                                // 持续维持 PLAYING + 无 transition：Folia 内部 effect 可能把状态改回 IDLE
+                                // 或写入 transitionDisplay 遮蔽歌词，每帧拉回保证 visualizer 一直有 activeLine。
+                                + "  if(s.playerState!=='PLAYING') patch.playerState='PLAYING';"
+                                + "  if(s.transitionDisplay) patch.transitionDisplay=null;"
+                                // 按进度算出当前行并维持：stage/播放 effect 会把 currentLineIndex 改成 -1，
+                                // 一旦 -1 → activeLine=lines[-1]=null → classic visualizer 不渲染歌词。
+                                + "  var ls=s.lyrics&&s.lyrics.lines?s.lyrics.lines:null;"
+                                + "  if(ls&&ls.length){var idx=0;for(var i=0;i<ls.length;i++){if(ls[i].startTime<=" + pSecFinal + ")idx=i;else break;}"
+                                + "    if(s.currentLineIndex!==idx) patch.currentLineIndex=idx;}"
                                 + "  if(Object.keys(patch).length) pb.setState(patch);"
                                 + "}"
-                                + "// 同步 motionSignals 的所有 MotionValue（让 visualizer 的 currentTime 实时更新）"
                                 + "try{"
                                 + "  for(var k in window){"
                                 + "    if(k.indexOf('__folia_exports_')!==0)continue;"
                                 + "    try{var v=window[k];"
-                                + "      if(v&&typeof v.set==='function'&&typeof v.get==='function'&&typeof v.get()==='number'){v.set(" + pSec + ");}}"
+                                + "      if(v&&typeof v.set==='function'&&typeof v.get==='function'&&typeof v.get()==='number'){v.set(" + pSecFinal + ");}}"
                                 + "    catch(x){}"
                                 + "  }"
                                 + "}catch(x){}"
@@ -6295,6 +6663,304 @@ public class PlayerApp extends Application {
         foliaHttpServer.createContext("/", ex -> {
             try {
                 String path = ex.getRequestURI().getPath();
+                // 刷新浏览器存活心跳（每个请求都算，包括静态资源）
+                foliaLastReqWallTime = System.currentTimeMillis();
+                // 关闭上报后又有新请求 → 说明只是刷新/跳转，取消快速恢复
+                if (foliaCloseReportedAt > 0) foliaCloseReportedAt = 0;
+
+                // ==== 屏蔽 PWA：防止浏览器缓存 service worker 拦截新 dist 请求 ====
+                // sw.js / registerSW.js / workbox-*.js / manifest.webmanifest 全部屏蔽
+                if (path.equals("/sw.js") || path.equals("/registerSW.js") || path.equals("/manifest.webmanifest")
+                        || path.startsWith("/workbox-") || path.endsWith(".webmanifest")) {
+                    // registerSW.js 返回空脚本（阻止 SW 注册）；其他 404
+                    if (path.equals("/registerSW.js")) {
+                        byte[] emptyScript = "// PWA disabled by Java HttpServer (host mode)\n".getBytes(StandardCharsets.UTF_8);
+                        ex.getResponseHeaders().set("Content-Type", "application/javascript");
+                        ex.sendResponseHeaders(200, emptyScript.length);
+                        ex.getResponseBody().write(emptyScript);
+                    } else {
+                        ex.sendResponseHeaders(404, 0);
+                    }
+                    ex.getResponseBody().close();
+                    return;
+                }
+
+                // ==== /api/state：Folia 原生 useHostSync 轮询的 host state ====
+                // 极简模型：poll 只喂 metadata + commands，绝不返回 playing/currentTimeSec
+                // Folia audio 是唯一的播放控制者
+                if (path.equals("/api/state")) {
+                    StringBuilder sb = new StringBuilder("{");
+                    // ★ 关键：用 audioPlayer.getCurrentBvid() 而不是 PlayerApp.currentBvid
+                    // PlayerApp.currentBvid 在 playBvid() 调用前就换了（早于文件就绪），
+                    // 但 audioPlayer.getCurrentBvid() 只有在 startLocalMedia() 成功（文件已下载转码）才会更新。
+                    // 这样 Folia 切歌时 /__audio 一定有文件可读，不会 404。
+                    String bvid = (audioPlayer != null && audioPlayer.getCurrentBvid() != null)
+                        ? audioPlayer.getCurrentBvid()
+                        : (currentBvid != null ? currentBvid : "");
+                    long now = System.currentTimeMillis();
+                    if (now - lastFoliaStateLog > 2000) {
+                        lastFoliaStateLog = now;
+                        System.out.println("[Folia-state] playerBvid=" + bvid
+                            + " file=" + (audioPlayer != null && audioPlayer.getCurrentAudioFile() != null
+                                ? audioPlayer.getCurrentAudioFile().getName()
+                                : "NULL")
+                            + " size=" + (audioPlayer != null && audioPlayer.getCurrentAudioFile() != null
+                                ? audioPlayer.getCurrentAudioFile().length() : 0));
+                    }
+                    sb.append("\"audioSrc\":\"http://localhost:").append(foliaHttpPort).append("/__audio?v=").append(bvid).append("\",");
+                    sb.append("\"songId\":\"").append(foliaJsStr(bvid)).append("\",");
+                    String title = currentResolvedTitle;
+                    if (title == null || title.trim().isEmpty()) title = currentTitleKey;
+                    if (title == null) title = "";
+                    sb.append("\"title\":\"").append(foliaJsStr(title)).append("\",");
+                    String artist = "";
+                    if (currentFavVideo != null && currentFavVideo.upName != null) artist = currentFavVideo.upName;
+                    else if (leftArtist != null && leftArtist.getText() != null) {
+                        String t = leftArtist.getText();
+                        if (!"加载中...".equals(t) && !t.isEmpty()) artist = t;
+                    }
+                    sb.append("\"artist\":\"").append(foliaJsStr(artist)).append("\",");
+                    sb.append("\"durationMs\":").append(Math.max(0, (long) lastKnownTotal)).append(",");
+                    if (foliaCoverUrl != null && !foliaCoverUrl.isEmpty()) {
+                        sb.append("\"coverUrl\":\"").append(foliaJsStr(foliaCoverUrl)).append("\",");
+                    }
+                    try {
+                        String jsonLyrics = foliaLyricsJson();
+                        String lyricsB64 = jsonLyrics != null
+                            ? Base64.getEncoder().encodeToString(jsonLyrics.getBytes(StandardCharsets.UTF_8))
+                            : "";
+                        sb.append("\"lyricsB64\":\"").append(lyricsB64).append("\",");
+                    } catch (Exception e) {
+                        sb.append("\"lyricsB64\":\"\",");
+                    }
+                    // playQueue：Java 歌单 → Folia queue
+                    try {
+                        String pq = foliaPlaylistJson();
+                        sb.append("\"playQueue\":").append(pq).append(",");
+                    } catch (Exception e) {
+                        sb.append("\"playQueue\":[],");
+                    }
+                    // switching：主播放器正在切歌（新曲目已选定但文件尚未就绪）→ Folia 立即静音旧歌
+                    boolean foliaSwitching = audioPlayer != null
+                        && audioPlayer.getCurrentBvid() != null
+                        && currentBvid != null
+                        && !currentBvid.equals(audioPlayer.getCurrentBvid());
+                    sb.append("\"switching\":").append(foliaSwitching).append(",");
+                    // lyric offset (seconds → ms)：唯一需要同步给 Folia 的歌词状态
+                    sb.append("\"lyricOffsetMs\":").append((long) (lyricSessionOffset * 1000.0));
+                    sb.append("}");
+                    byte[] jsonBytes = sb.toString().getBytes(StandardCharsets.UTF_8);
+                    ex.getResponseHeaders().set("Access-Control-Allow-Origin", "*");
+                    ex.getResponseHeaders().set("Cache-Control", "no-store");
+                    ex.getResponseHeaders().set("Content-Type", "application/json");
+                    ex.sendResponseHeaders(200, jsonBytes.length);
+                    ex.getResponseBody().write(jsonBytes);
+                    ex.getResponseBody().close();
+                    return;
+                }
+
+                // ==== POST /api/host-events：Folia 用户操作上报（play/pause/seek/lyricOffset）====
+                // 极简模型：Folia 只在以下时机 POST
+                //   songChange  — 用户在 Folia 里切歌（让 Java 下载新曲目）
+                //   lyricOffset — 用户在 Folia 里改歌词偏移
+                //   close       — 关闭浏览器前用 sendBeacon 上报最终进度/播放态
+                if ("POST".equalsIgnoreCase(ex.getRequestMethod()) && path.equals("/api/host-events")) {
+                    try {
+                        int clen = ex.getRequestHeaders().getFirst("Content-Length") != null
+                            ? Integer.parseInt(ex.getRequestHeaders().getFirst("Content-Length")) : 0;
+                        byte[] body = new byte[clen];
+                        ex.getRequestBody().read(body);
+                        String json = new String(body, StandardCharsets.UTF_8);
+                        System.out.println("[Folia-POST] body=" + json);
+
+                        String type = extractJsonStr(json, "type");
+
+                        final String evtType = type;
+                        switch (evtType) {
+                            case "close": {
+                                // 关闭前上报：记录最终进度与播放态，watchdog 收到后 2.5s 内恢复主播放器
+                                double sec = extractJsonDouble(json, "timeSec");
+                                boolean playingFlag = java.util.regex.Pattern
+                                    .compile("\"playing\"\\s*:\\s*true").matcher(json).find();
+                                foliaCloseSec = sec;
+                                foliaClosePlaying = playingFlag;
+                                foliaCloseReportedAt = System.currentTimeMillis();
+                                System.out.println("[Folia] 关闭上报: " + sec + "s, playing=" + playingFlag);
+                                break;
+                            }
+                            case "lyricOffset": {
+                                double offsetMs = extractJsonDouble(json, "offsetMs");
+                                final long deltaMs = (long) (offsetMs - (long)(lyricSessionOffset * 1000.0));
+                                final double newOffsetSec = offsetMs / 1000.0;
+                                Platform.runLater(() -> {
+                                    lyricSessionOffset = newOffsetSec;
+                                    if (lyricView != null) {
+                                        lyricView.applyOffset(deltaMs);
+                                        updateOffsetLabel();
+                                        saveSettings();
+                                    }
+                                });
+                                break;
+                            }
+                            case "songChange": {
+                                // ★ Folia 在自己界面里切了歌 → 通知 Java 下载转码 → /api/state 返回新 audioSrc → Folia 加载
+                                String newBvid = extractJsonStr(json, "songId");
+                                if (newBvid != null && !newBvid.isEmpty() && audioPlayer != null) {
+                                    System.out.println("[Folia] Folia 切歌 → Java playBvid: " + newBvid
+                                        + " (was " + currentBvid + ")");
+                                    Platform.runLater(() -> {
+                                        // 先 pause 旧播放（防御）
+                                        if (audioPlayer.isPlaying()) audioPlayer.pause();
+                                        currentBvid = newBvid;
+                                        // 先在歌单里找已知标题/作者，找不到再用 bvid 占位
+                                        FavVideo known = findKnownVideo(newBvid);
+                                        currentFavVideo = known;
+                                        String knownTitle = (known != null && known.title != null && !known.title.isEmpty())
+                                            ? known.title : newBvid;
+                                        String knownUp = (known != null && known.upName != null && !known.upName.isEmpty())
+                                            ? known.upName : null;
+                                        applyLeftTitle(newBvid, knownTitle);
+                                        leftArtist.setText(knownUp != null ? knownUp : "加载中...");
+                                        System.out.println("[Folia] 切歌 UI: bvid=" + newBvid
+                                            + " known=" + (known != null)
+                                            + " title=" + knownTitle
+                                            + " up=" + knownUp);
+                                        leftTime.setText("0:00 / --:--");
+                                        progressSlider.setMax(1); progressSlider.setValue(0);
+                                        loadAndSetCover(newBvid);
+                                        // 触发下载转码——完成后 startLocalMedia 会更新 audioPlayer.getCurrentBvid()
+                                        audioPlayer.playBvid(newBvid);
+                                        // 标题/作者未知时后台补全（与启动恢复走同一套 fetchVideoMeta）
+                                        boolean needTitle = newBvid.equals(currentResolvedTitle);
+                                        boolean needUp = knownUp == null;
+                                        if (needTitle || needUp) {
+                                            new Thread(() -> {
+                                                FavVideo meta = fetchVideoMeta(newBvid);
+                                                Platform.runLater(() -> {
+                                                    if (!newBvid.equals(currentBvid)) return; // 期间又切歌了
+                                                    if (meta != null) {
+                                                        if (meta.title != null && !meta.title.isEmpty()) {
+                                                            applyLeftTitle(newBvid, meta.title);
+                                                        }
+                                                        if (meta.upName != null && !meta.upName.isEmpty()) {
+                                                            leftArtist.setText(meta.upName);
+                                                        }
+                                                        if (meta.durationStr() != null) {
+                                                            leftTime.setText("0:00 / " + meta.durationStr());
+                                                        }
+                                                        // 回写歌单缓存，Folia 队列下次 poll 会带上真实歌名/作者
+                                                        updateKnownVideo(newBvid, meta.title, meta.upName);
+                                                    } else if (needUp) {
+                                                        leftArtist.setText("B 站视频");
+                                                    }
+                                                    // 标题异步拿到后再搜歌词（早了会拿 BV 号去搜）
+                                                    loadLyricForCurrent();
+                                                });
+                                            }, "folia-meta").start();
+                                        } else {
+                                            loadLyricForCurrent();
+                                        }
+                                    });
+                                }
+                                break;
+                            }
+                            default:
+                                break;
+                        }
+
+                        byte[] ok = "{\"ok\":true}".getBytes(StandardCharsets.UTF_8);
+                        ex.getResponseHeaders().set("Access-Control-Allow-Origin", "*");
+                        ex.getResponseHeaders().set("Content-Type", "application/json");
+                        ex.sendResponseHeaders(200, ok.length);
+                        ex.getResponseBody().write(ok);
+                        ex.getResponseBody().close();
+                        return;
+                    } catch (Exception e) {
+                        System.err.println("[Folia] host-event 解析失败: " + e.getMessage());
+                        try { ex.sendResponseHeaders(400, 0); ex.getResponseBody().close(); } catch (Exception ignored) {}
+                        return;
+                    }
+                }
+
+                // ==== /api/folia-debug：Folia 侧诊断信息 POST 回来 → Java 控制台打印 ====
+                if ("POST".equalsIgnoreCase(ex.getRequestMethod()) && path.equals("/api/folia-debug")) {
+                    try {
+                        int clen = ex.getRequestHeaders().getFirst("Content-Length") != null
+                            ? Integer.parseInt(ex.getRequestHeaders().getFirst("Content-Length")) : 0;
+                        byte[] body = new byte[clen];
+                        ex.getRequestBody().read(body);
+                        String json = new String(body, StandardCharsets.UTF_8);
+                        System.out.println("[Folia-DEBUG] " + json);
+                        byte[] ok = "{\"ok\":true}".getBytes(StandardCharsets.UTF_8);
+                        ex.getResponseHeaders().set("Access-Control-Allow-Origin", "*");
+                        ex.sendResponseHeaders(200, ok.length);
+                        ex.getResponseBody().write(ok);
+                        ex.getResponseBody().close();
+                        return;
+                    } catch (Exception e) {
+                        try { ex.sendResponseHeaders(400, 0); ex.getResponseBody().close(); } catch (Exception ignored) {}
+                        return;
+                    }
+                }
+
+                // Folia 接管声音：把当前本地音频文件以 HTTP 暴露（<audio crossOrigin> 需要 CORS 头）
+                if (path.equals("/__audio")) {
+                    File audio = (audioPlayer != null) ? audioPlayer.getCurrentAudioFile() : null;
+                    long now = System.currentTimeMillis();
+                    // 限流日志：每秒最多打印一条（但 404 时单独打印不限流）
+                    if (now - lastFoliaAudioLog > 1000) {
+                        lastFoliaAudioLog = now;
+                        String range = ex.getRequestHeaders().getFirst("Range");
+                        System.out.println("[Folia-__audio] " + ex.getRequestMethod()
+                            + (range != null ? " range=" + range : "")
+                            + " playerBvid=" + (audioPlayer != null ? audioPlayer.getCurrentBvid() : "null")
+                            + " file=" + (audio != null ? (audio.getName() + " (" + audio.length() + "B)") : "NULL")
+                            + " exists=" + (audio != null && audio.exists()));
+                    }
+                    if (audio == null || !audio.exists()) {
+                        System.out.println("[Folia-__audio] 404! playerBvid=" + (audioPlayer != null ? audioPlayer.getCurrentBvid() : "null")
+                            + " file=" + (audio != null ? audio.getName() : "NULL")
+                            + " exists=" + (audio != null && audio.exists()));
+                        ex.getResponseHeaders().set("Access-Control-Allow-Origin", "*");
+                        ex.sendResponseHeaders(404, 0); ex.getResponseBody().close(); return;
+                    }
+                    byte[] adata = java.nio.file.Files.readAllBytes(audio.toPath());
+                    String name = audio.getName().toLowerCase();
+                    // 实际下载的是 .m4a(AAC)，必须回 audio/mp4；写死 audio/mpeg 会让 WebEngine 判为
+                    // ERROR_MEDIA_INVALID(errCode=260) 无法解码。
+                    String mime = name.endsWith(".m4a") || name.endsWith(".m4s") || name.endsWith(".mp4")
+                            ? "audio/mp4" : "audio/mpeg";
+                    ex.getResponseHeaders().set("Access-Control-Allow-Origin", "*");
+                    ex.getResponseHeaders().set("Access-Control-Allow-Headers", "*");
+                    ex.getResponseHeaders().set("Content-Type", mime);
+                    ex.getResponseHeaders().set("Accept-Ranges", "bytes");
+                    // <audio> 加载/拖动会发 HEAD 与 Range 请求，必须正确响应，否则媒体初始化失败。
+                    if ("HEAD".equalsIgnoreCase(ex.getRequestMethod())) {
+                        ex.sendResponseHeaders(200, -1); ex.getResponseBody().close(); return;
+                    }
+                    String range = ex.getRequestHeaders().getFirst("Range");
+                    if (range != null && range.startsWith("bytes=")) {
+                        try {
+                            String spec = range.substring(6).trim();
+                            int dash = spec.indexOf('-');
+                            long start = Long.parseLong(spec.substring(0, dash));
+                            long end = (dash + 1 < spec.length() && !spec.substring(dash + 1).isEmpty())
+                                    ? Long.parseLong(spec.substring(dash + 1)) : adata.length - 1;
+                            if (end >= adata.length) end = adata.length - 1;
+                            if (start <= end) {
+                                int len = (int) (end - start + 1);
+                                ex.getResponseHeaders().set("Content-Range", "bytes " + start + "-" + end + "/" + adata.length);
+                                ex.sendResponseHeaders(206, len);
+                                ex.getResponseBody().write(adata, (int) start, len);
+                                ex.getResponseBody().close();
+                                return;
+                            }
+                        } catch (Exception ignore) {}
+                    }
+                    ex.sendResponseHeaders(200, adata.length);
+                    ex.getResponseBody().write(adata); ex.getResponseBody().close();
+                    return;
+                }
                 if (path.equals("/")) path = "/index.html";
                 File file = new File(rootDir, path.substring(1));
                 if (!file.exists() || file.isDirectory()) {
@@ -6307,6 +6973,21 @@ public class PlayerApp extends Application {
                     return;
                 }
                 byte[] data = java.nio.file.Files.readAllBytes(file.toPath());
+                // Patch index.html: strip PWA service worker registration + unregister any existing SWs
+                if (path.equals("/index.html")) {
+                    String html = new String(data, StandardCharsets.UTF_8);
+                    html = html.replaceAll("<link rel=\"manifest\"[^>]*>", "");
+                    html = html.replaceAll("<script[^>]*registerSW[^>]*></script>", "");
+                    html = html.replaceAll("<script id=\"vite-plugin-pwa:register-sw\"[^>]*></script>", "");
+                    // Inline script: unregister existing SWs + delete caches — prevents stale SW from intercepting requests
+                    String unregisterSw = "<script>"
+                        + "if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().forEach(function(r){r.unregister();});"
+                        + "if(window.caches){caches.keys().then(function(keys){keys.forEach(function(k){caches.delete(k);});});}}"
+                        + "document.addEventListener('DOMContentLoaded',function(){if('serviceWorker' in navigator){navigator.serviceWorker.getRegistrations().forEach(function(r){r.unregister();});}});}"
+                        + "</script>";
+                    html = html.replace("</head>", unregisterSw + "</head>");
+                    data = html.getBytes(StandardCharsets.UTF_8);
+                }
                 String contentType = guessContentType(path);
                 ex.getResponseHeaders().set("Content-Type", contentType + "; charset=utf-8");
                 ex.sendResponseHeaders(200, data.length);
@@ -6326,6 +7007,44 @@ public class PlayerApp extends Application {
             foliaHttpServer.stop(0);
             foliaHttpServer = null;
             System.out.println("[Folia] HttpServer stopped");
+        }
+    }
+
+    /** 浏览器存活监控：每秒检查，超过 8 秒没请求 → 浏览器已关 → 恢复音量/进度/3D 歌词 */
+    private void startFoliaWatchdog() {
+        stopFoliaWatchdog();
+        foliaLastReqWallTime = System.currentTimeMillis();  // 初始化心跳
+        foliaWatchdogRunning = true;
+        foliaWatchdogThread = new Thread(() -> {
+            System.out.println("[Folia] Watchdog started (timeout=8s)");
+            while (foliaWatchdogRunning) {
+                try {
+                    Thread.sleep(1000);
+                    if (!foliaWatchdogRunning) break;
+                    if (!foliaOwningAudio) break;  // 已经恢复过了
+                    long idleMs = System.currentTimeMillis() - foliaLastReqWallTime;
+                    // 收到关闭上报（sendBeacon）后只需 2.5s 宽限；否则按 8s 判断
+                    long timeoutMs = foliaCloseReportedAt > 0 ? 2500 : 8000;
+                    if (idleMs > timeoutMs) {
+                        System.out.println("[Folia] Watchdog: no request for " + idleMs + "ms → browser closed, restoring...");
+                        restoreFromFolia();
+                        stopFoliaHttpServer();
+                        break;
+                    }
+                } catch (InterruptedException e) { break; }
+            }
+            foliaWatchdogRunning = false;
+            System.out.println("[Folia] Watchdog stopped");
+        }, "FoliaWatchdog");
+        foliaWatchdogThread.setDaemon(true);
+        foliaWatchdogThread.start();
+    }
+
+    private void stopFoliaWatchdog() {
+        foliaWatchdogRunning = false;
+        if (foliaWatchdogThread != null) {
+            foliaWatchdogThread.interrupt();
+            foliaWatchdogThread = null;
         }
     }
 
@@ -6387,7 +7106,7 @@ public class PlayerApp extends Application {
     /**
      * 从文件路径重新加载自定义字体并注册到 JVM（供重启后恢复拖入的字体）。
      * 返回实际注册到的 family 名；加载失败（文件缺失 / 格式不支持）返回 null。
-     * 同时打印诊断信息，便于确认“重启后字体是否真的注册成功、family 名是否和存储的一致”。
+     * 同时打印诊断信息，便于确认"重启后字体是否真的注册成功、family 名是否和存储的一致"。
      */
     private String reloadCustomFont(String tag, String path, String expectFamily) {
         if (path == null || path.isEmpty()) return null;
@@ -7235,7 +7954,7 @@ public class PlayerApp extends Application {
         return box;
     }
 
-    /** 从 rangedSlider 返回的包装 HBox 中取出数值 Label（用于改成“自动”等自定义文案） */
+    /** 从 rangedSlider 返回的包装 HBox 中取出数值 Label（用于改成"自动"等自定义文案） */
     private Label getLabelFromRangedBox(Node box) {
         if (box instanceof HBox hb && !hb.getChildren().isEmpty()) {
             Node first = hb.getChildren().get(0);
@@ -7488,6 +8207,7 @@ public class PlayerApp extends Application {
             try (var in = Files.newInputStream(p)) { prop.load(in); }
             autoPlayOnStartup = Boolean.parseBoolean(prop.getProperty("autoPlayOnStartup", "false"));
             disclaimerShown = Boolean.parseBoolean(prop.getProperty("disclaimerShown", "false"));
+            foliaFullscreenTipShown = Boolean.parseBoolean(prop.getProperty("foliaFullscreenTipShown", "false"));
             loopMode = prop.getProperty("loopMode", "列表循环");
             try { defaultVolume = Integer.parseInt(prop.getProperty("defaultVolume", "50")); }
             catch (NumberFormatException ignore) { defaultVolume = 50; }
@@ -7612,6 +8332,7 @@ public class PlayerApp extends Application {
             Properties prop = new Properties();
             prop.setProperty("autoPlayOnStartup", String.valueOf(autoPlayOnStartup));
             prop.setProperty("disclaimerShown", String.valueOf(disclaimerShown));
+            prop.setProperty("foliaFullscreenTipShown", String.valueOf(foliaFullscreenTipShown));
             prop.setProperty("loopMode", loopMode);
             prop.setProperty("defaultVolume", String.valueOf(defaultVolume));
             prop.setProperty("highAudioQuality", String.valueOf(highAudioQuality));
@@ -7730,7 +8451,7 @@ public class PlayerApp extends Application {
         }
     }
 
-    /** 初始化系统托盘。不支持时保持“关闭即退出”的原有行为 */
+    /** 初始化系统托盘。不支持时保持"关闭即退出"的原有行为 */
     private void setupSystemTray() {
         if (!java.awt.SystemTray.isSupported()) {
             trayAvailable = false;
@@ -7740,8 +8461,8 @@ public class PlayerApp extends Application {
             systemTray = java.awt.SystemTray.getSystemTray();
             trayIcon = new java.awt.TrayIcon(makeTrayImage(), "plain bmusic player");
             trayIcon.setImageAutoSize(true);
-            // 右键托盘图标弹出 JavaFX 菜单；左键作兜底。以“按下”为准，
-            // 快速右击时松手才带 isPopupTrigger，若不防二次触发会“打开又被关掉”，
+            // 右键托盘图标弹出 JavaFX 菜单；左键作兜底。以"按下"为准，
+            // 快速右击时松手才带 isPopupTrigger，若不防二次触发会"打开又被关掉"，
             // 反而只有长按才看得到菜单。
             trayIcon.addMouseListener(new java.awt.event.MouseAdapter() {
                 @Override public void mousePressed(java.awt.event.MouseEvent e) {
@@ -7838,7 +8559,7 @@ public class PlayerApp extends Application {
         showTrayMenu(null);
     }
 
-    /** 构建托盘菜单（无装饰小窗，含“显示主窗口 / 退出”） */
+    /** 构建托盘菜单（无装饰小窗，含"显示主窗口 / 退出"） */
     private void buildTrayMenu() {
         trayMenuStage = new Stage();
         trayMenuStage.initStyle(javafx.stage.StageStyle.UNDECORATED);
@@ -7921,7 +8642,7 @@ public class PlayerApp extends Application {
         primaryStage.hide();
     }
 
-    /** 托盘菜单“退出”：移除图标并真正退出 JVM */
+    /** 托盘菜单"退出"：移除图标并真正退出 JVM */
     private void trayExit() {
         trayExit = true;
         if (systemTray != null && trayIcon != null) {
@@ -7990,7 +8711,7 @@ public class PlayerApp extends Application {
                 while (ipcServer != null && !ipcServer.isClosed()) {
                     try (java.net.Socket s = ipcServer.accept()) {
                         try { s.getOutputStream().write(1); } catch (Exception ignored) {}
-                        if (appInstance != null) appInstance.showPrimaryWindow();  // 复用托盘“显示窗口”
+                        if (appInstance != null) appInstance.showPrimaryWindow();  // 复用托盘"显示窗口"
                     } catch (java.io.IOException ignored) { }
                 }
             }, "ipc-show-window");

@@ -29,6 +29,13 @@ function fetchUrl(url, customHeaders = {}) {
                 ...customHeaders,
             }
         }, (res) => {
+            // 校验状态码：4xx/5xx 直接 reject，避免把错误页当歌词解析（静默失败难调试）
+            const code = res.statusCode || 0;
+            if (code < 200 || code >= 300) {
+                res.resume();
+                reject(new Error('HTTP ' + code));
+                return;
+            }
             let data = '';
             res.on('data', c => data += c);
             res.on('end', () => resolve(data));
@@ -43,11 +50,12 @@ function cleanKeyword(keyword) {
     if (m) return m[1].trim();
     m = keyword.match(/「([^」]+)」/);
     if (m) return m[1].trim();
-    // "歌名 - 歌手" 或 "歌手 - 歌名"：取较短的一段作为歌名（歌名通常更短），提高命中率
+    // "歌名 - 歌手" 或 "歌手 - 歌名"：优先取较长的一段作歌名。
+    // 之前取较短段会把 "JVKE - golden hour 正式版" 误判为 "JVKE"（歌手名），搜词失败。
     if (keyword.includes(' - ')) {
         const parts = keyword.split(' - ').map(s => s.trim()).filter(Boolean);
         if (parts.length >= 2) {
-            parts.sort((a, b) => a.length - b.length);
+            parts.sort((a, b) => b.length - a.length);
             return parts[0];
         }
     }
@@ -59,20 +67,25 @@ async function fetchQQ() {
         const kw = cleanKeyword(title);
         const enc = encodeURIComponent(kw);
         const searchData = await fetchUrl(
-            `https://c.y.qq.com/soso/fcgi-bin/client_search_cp?w=${enc}&format=json&n=1&p=1`,
+            `https://c.y.qq.com/soso/fcgi-bin/client_search_cp?w=${enc}&format=json&n=5&p=1`,
             { 'Referer': QQ_REFERER }
         );
         const search = JSON.parse(searchData);
-        const song = search.data?.song?.list?.[0];
-        if (!song) return null;
-        const mid = song.songmid;
-        const lyricData = await fetchUrl(
-            `https://c.y.qq.com/lyric/fcgi-bin/fcg_query_lyric_new.fcg?nobase64=1&songmid=${mid}`,
-            qqHeaders()
-        );
-        const lyric = JSON.parse(lyricData);
-        if (lyric.retcode && lyric.retcode !== 0) return null;
-        if (lyric.lyric) return { lyric: lyric.lyric, source: 'qq' };
+        const list = search.data?.song?.list || [];
+        // 逐条尝试：第一条没歌词时回退到后续结果，提高命中率
+        for (const song of list) {
+            const mid = song.songmid;
+            if (!mid) continue;
+            try {
+                const lyricData = await fetchUrl(
+                    `https://c.y.qq.com/lyric/fcgi-bin/fcg_query_lyric_new.fcg?nobase64=1&songmid=${mid}`,
+                    qqHeaders()
+                );
+                const lyric = JSON.parse(lyricData);
+                if (lyric.retcode && lyric.retcode !== 0) continue;
+                if (lyric.lyric) return { lyric: lyric.lyric, source: 'qq' };
+            } catch (e) {}
+        }
     } catch (e) {}
     return null;
 }
@@ -186,13 +199,11 @@ const MULTI = { qq: fetchQQMulti, kugou: fetchKugouMulti };
 
 /**
  * 按传入顺序逐个尝试，前一个失败（返回 null）才试下一个。
- * 用于尊重用户在设置里指定的来源优先级。
- * 注意：QQ 音乐接口当前常返回 500，故在内部把 kugou 排到 qq 之前，
- * 避免每次取词都被失效的 QQ 先浪费一次请求（甚至连接挂起拖慢整体）。
+ * 严格尊重用户在设置里指定的来源优先级——不再强制把 kugou 排到 qq 前面。
+ * 之前强制重排会导致用户配置的顺序失效（bug 修复）。
  */
 function prioritize(names) {
-    const rank = n => (n === 'kugou' ? 0 : (n === 'qq' ? 1 : 2));
-    return [...names].sort((a, b) => rank(a) - rank(b));
+    return [...names];
 }
 
 async function tryInOrder(names) {
@@ -211,18 +222,21 @@ async function tryInOrder(names) {
 function raceProviders(providers, timeout = 10000) {
     return new Promise((resolve) => {
         let settled = false;
-        const timer = setTimeout(() => {
-            if (!settled) { settled = true; resolve(null); }
-        }, timeout);
+        let finished = 0;
+        const done = (value) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            resolve(value);
+        };
+        const timer = setTimeout(() => done(null), timeout);
         providers.forEach(async (p) => {
             try {
                 const result = await p();
-                if (result && !settled) {
-                    settled = true;
-                    clearTimeout(timer);
-                    resolve(result);
-                }
+                if (result) { done(result); return; }
             } catch (e) {}
+            // 每个 provider 结束（失败也算）就计数，全部失败立即 resolve，不必等满超时
+            if (++finished >= providers.length) done(null);
         });
     });
 }

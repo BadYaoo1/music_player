@@ -11,6 +11,7 @@ import { useScratchpadPlayback, useScratchpadQueuePort } from './components/app/
 import { useCommandPalette } from './components/command-palette/useCommandPalette';
 import { useCommandPaletteContext } from './hooks/useCommandPaletteContext';
 import { useReducedMotionFor } from './hooks/useReducedMotionFor';
+import { useHostSync } from './hooks/useHostSync';
 import AppShell from './components/app/AppShell';
 import Home from './components/app/Home';
 import PlayerPanel from './components/app/PlayerPanel';
@@ -209,6 +210,7 @@ const LOCAL_TAIL_DECODE_ERROR_TOLERANCE_SEC = 3;
 
 export default function App() {
     countRender('App');
+    useHostSync();
     const { t } = useTranslation();
     const {
         navidromeEnabled, setNavidromeEnabledState,

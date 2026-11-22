@@ -31,7 +31,8 @@ public class BiliAudioPlayer {
     private volatile long currentRequestId = 0;
 
     // ============ WBI 签名（不变） ============
-    private static String wbiImgKey = null, wbiSubKey = null, wbiMixinKey = null;
+    private static String wbiImgKey = null, wbiSubKey = null;
+    private static volatile String wbiMixinKey = null;
     private static long lastWbiFetch = 0;
     private static final long WBI_CACHE_MS = 10 * 60 * 1000;
     // B站官方 WBI 混淆表，恰好 64 项（原被误写成 139 项，后半段是复制残留）
@@ -41,7 +42,7 @@ public class BiliAudioPlayer {
             37, 48,  7, 16, 24, 55, 40, 61, 26, 17,  0,  1, 60, 51, 30,  4,
             22, 25, 54, 21, 56, 59,  6, 63, 57, 62, 11, 36, 20, 34, 44, 52
     };
-    private static void getWbiKeys(String cookie) throws IOException {
+    private static synchronized void getWbiKeys(String cookie) throws IOException {
         long now = System.currentTimeMillis();
         if (wbiMixinKey != null && (now - lastWbiFetch) < WBI_CACHE_MS) return;
         String navJson = getWithCookie("https://api.bilibili.com/x/web-interface/nav", cookie);
@@ -92,6 +93,12 @@ public class BiliAudioPlayer {
 
     // ============ 成员 ============
     private MediaPlayer mediaPlayer;
+    private double currentVolume = 1.0;  // 跟踪当前音量（MediaPlayer 无 getVolume）
+    /** PlayerApp 注册的 host 同步监听器 */
+    public interface HostListener { void onSeek(double ms); void onPlay(); void onPause(); }
+    private volatile HostListener hostListener;
+    /** 宿主模式：Folia 接管音频（浏览器直接读 /__audio）。为 true 时只准备文件供 HTTP 读取，不要用 MediaPlayer 出声。 */
+    public volatile boolean hostMode = false;
     private String cookie = "";
     private String currentBvid = null;
     private File currentTempFile;
@@ -127,12 +134,21 @@ public class BiliAudioPlayer {
     public void setCallback(PlayCallback cb) { this.cb = cb; }
     public void setCookie(String cookie) { if (cookie != null) this.cookie = cookie; }
     public String getCurrentBvid() { return currentBvid; }
+    /** 当前正在播放的本地音频文件（Folia 接管声音时通过其 HttpServer 暴露）；未就绪时为 null */
+    public File getCurrentAudioFile() {
+        // 不依赖 mediaPlayer 是否存在：切歌期间 mediaPlayer 会被 stopInternal() 置 null，
+        // 但 currentTempFile 在 startLocalMedia 里设值、在 cleanupTemp 才清，
+        // 期间 /__audio 可以继续喂旧文件，避免 Folia 音频加载失败。
+        return currentTempFile;
+    }
 
     // ============ 播放控制 ============
     public void playBvid(String bvid) {
         long reqId = requestCounter.incrementAndGet();
         currentRequestId = reqId;
-        this.currentBvid = bvid;
+        // ★ 不在此处设 currentBvid！—— 切歌期间文件还没准备好，设早了会让 /api/state 立刻变 bvid
+        // 导致 Folia 立刻切歌 → 请求 /__audio → 文件还没 → 404
+        // currentBvid 延后到 startLocalMedia() 成功设文件后再赋值
         stopInternal();
         prefetchRequested.remove(bvid);
 
@@ -143,7 +159,7 @@ public class BiliAudioPlayer {
             System.out.println("[audio] 预取命中，直接播放缓存: " + bvid);
             Platform.runLater(() -> {
                 if (reqId != currentRequestId) { cleanupFile(f); return; }
-                startLocalMedia(f);
+                startLocalMedia(f, bvid);
             });
             return;
         }
@@ -164,7 +180,7 @@ public class BiliAudioPlayer {
                 final long finalReqId = reqId;
                 Platform.runLater(() -> {
                     if (finalReqId != currentRequestId) { cleanupFile(finalTmp); return; }
-                    startLocalMedia(finalTmp);
+                    startLocalMedia(finalTmp, bvid);
                 });
             } catch (Exception e) {
                 if (reqId != currentRequestId) { if (tmp != null) cleanupFile(tmp); return; }
@@ -218,9 +234,17 @@ public class BiliAudioPlayer {
     }
 
     /** ★ 修复 NPE：用 final 局部变量持有 mp */
-    private void startLocalMedia(File tmp) {
+    private void startLocalMedia(File tmp, String forBvid) {
         try {
+            // ★ 关键：这里才设 currentBvid——文件已经就绪，/api/state 立刻返回新 bvid + /__audio 立刻返回新文件
+            this.currentBvid = forBvid;
+            // 保留旧文件引用 → 先设新文件（/__audio 立刻可读新文件） → 再删旧文件
+            File old = currentTempFile;
             currentTempFile = tmp;
+            if (old != null && !old.equals(tmp)) cleanupFile(old);
+            System.out.println("[audio] startLocalMedia: file=" + tmp.getName() + " (" + tmp.length() + "B)"
+                + " bvid=" + forBvid);
+
             Media media = new Media(tmp.toURI().toString());
             mediaPlayer = new MediaPlayer(media);
 
@@ -251,8 +275,13 @@ public class BiliAudioPlayer {
                 if (cb != null) cb.onError(msg);
             });
 
-            mp.setVolume(1.0);
-            mp.play();
+            mp.setVolume(hostMode ? 0.0 : 1.0);
+            if (hostMode) {
+                // Folia 全屏接管中：只准备文件给 /__audio，主播放器不出声
+                System.out.println("[audio] hostMode: 主播放器保持静音（Folia 接管）");
+            } else {
+                mp.play();
+            }
         } catch (Exception e) {
             System.out.println("[audio] 创建 MediaPlayer 失败: " + e.getMessage());
             if (cb != null) cb.onError(e.getMessage());
@@ -267,14 +296,23 @@ public class BiliAudioPlayer {
             mediaPlayer.play(); if (cb != null) cb.onResumed();
         }
     }
-    public void pause() { if (mediaPlayer != null) mediaPlayer.pause(); }
-    public void resume() { if (mediaPlayer != null) mediaPlayer.play(); }
+    public void pause() {
+        if (mediaPlayer != null) mediaPlayer.pause();
+        var h = hostListener; if (h != null) h.onPause();
+    }
+    public void resume() {
+        if (mediaPlayer != null) mediaPlayer.play();
+        var h = hostListener; if (h != null) h.onPlay();
+    }
+
+    public void setHostListener(HostListener l) { this.hostListener = l; }
 
     public void stop() {
         requestCounter.incrementAndGet();
         currentRequestId = 0;
         currentBvid = null;
         stopInternal();
+        cleanupTemp();  // 真停 → 清文件（切歌时由 startLocalMedia 清旧文件）
         if (cb != null) cb.onStopped();
     }
 
@@ -283,7 +321,9 @@ public class BiliAudioPlayer {
             try { mediaPlayer.stop(); mediaPlayer.dispose(); } catch (Exception ignore) {}
             mediaPlayer = null;
         }
-        cleanupTemp();
+        // 注意：不调 cleanupTemp()，留着 currentTempFile 让 Folia /__audio 还能喂数据。
+        // 等 startLocalMedia(newFile) 成功后再清旧文件（见那里的 cleanupTemp 调用）。
+        // 如果是 stop() 真停（不切歌），调用方显式清。
     }
 
     public void seekTo(double ms) {
@@ -299,8 +339,13 @@ public class BiliAudioPlayer {
             if (max > 0 && target > max) target = max;
         }
         mediaPlayer.seek(new Duration(Math.max(0, target)));
+        var h = hostListener; if (h != null) h.onSeek(target);
     }
-    public void setVolume(double v) { if (mediaPlayer != null) mediaPlayer.setVolume(Math.max(0, Math.min(1, v))); }
+    public void setVolume(double v) {
+        currentVolume = Math.max(0, Math.min(1, v));
+        if (mediaPlayer != null) mediaPlayer.setVolume(currentVolume);
+    }
+    public double getVolume() { return currentVolume; }
     public boolean isPlaying() {
         return mediaPlayer != null && mediaPlayer.getStatus() == MediaPlayer.Status.PLAYING;
     }
@@ -311,7 +356,13 @@ public class BiliAudioPlayer {
         ffmpegChecked = true;
         try {
             Process p = new ProcessBuilder("ffmpeg", "-version").start();
-            ffmpegAvailable = (p.waitFor() == 0);
+            // 加超时：ffmpeg 卡住时不能让播放线程无限阻塞
+            if (p.waitFor(5, java.util.concurrent.TimeUnit.SECONDS)) {
+                ffmpegAvailable = (p.exitValue() == 0);
+            } else {
+                p.destroyForcibly();
+                ffmpegAvailable = false;
+            }
         } catch (Exception e) { ffmpegAvailable = false; }
         System.out.println("[audio] ffmpeg " + (ffmpegAvailable ? "可用" : "未安装，将直接播放 m4s"));
         return ffmpegAvailable;
@@ -333,9 +384,15 @@ public class BiliAudioPlayer {
             try (BufferedReader br = new BufferedReader(new InputStreamReader(p.getInputStream()))) {
                 while (br.readLine() != null) {}
             }
-            p.waitFor();
+            // 读流会等到进程结束，这里再 waitFor 只是取退出码；加超时兜底防止极端情况卡死
+            if (!p.waitFor(10, java.util.concurrent.TimeUnit.MINUTES)) p.destroyForcibly();
+            // 先判断转码产物是否有效，再决定删不删原始文件。
+            // 原顺序是先 cleanupFile(m4s) 再 return m4s.exists()?...：原文件已删，永远返回 null → 播放失败。
+            if (out.length() < 1024) {
+                cleanupFile(out);
+                return m4s;   // 转码失败：回退到原始 m4a/m4s 文件
+            }
             cleanupFile(m4s);
-            if (out.length() < 1024) return m4s.exists() ? m4s : null;
             System.out.println("[audio] 已转码 mp3: " + out.length() / 1024 + " KB");
             return out;
         } catch (Exception e) {
