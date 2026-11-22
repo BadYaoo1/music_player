@@ -1,2 +1,4 @@
-cd /d D:\Java\Projects_java\music_player
-"D:\Java\IntelliJ IDEA 2026.1.2\plugins\maven\lib\maven3\bin\mvn.cmd" clean javafx:run
+@echo off
+rem 进入脚本所在目录，避免依赖本机绝对路径
+cd /d "%~dp0"
+call mvn clean javafx:run
